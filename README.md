@@ -5,7 +5,7 @@ Orginally written by Tsu-Chien Weng and Stanislaw Nowak.<sup>1,2</sup>
 1. Abraham, B. et al. A high-throughput energy-dispersive tender X-ray spectrometer for shot-to-shot sulfur measurements. J Synchrotron Rad 26, 629–634 (2019). DOI: 10.1107/S1600577519002431
 2. Nowak, S. H. et al. A versatile Johansson-type tender x-ray emission spectrometer. Review of Scientific Instruments 91, 033101 (2020). DOI: 10.1063/1.5121853
    
-Two example jupyter notebooks are included `onepot_walkthrough.ipynb` and `Tender_Analysis_Example.ipynb`, along with Na<sub>2</sub>SO<sub>4</sub> sulfur RIXS  example dataset. 
+An example jupyter notebooks is included `Tender_Analysis_Example.ipynb`, along with a Na<sub>2</sub>SO<sub>4</sub> sulfur RIXS example dataset. 
 
 ## Package layout
 
