@@ -95,7 +95,7 @@ def extract_signal(
     files: Iterable[SifFile],
     threshold,
     bcg=0,
-    scan_nbrs=0,
+    scan_nbrs=None,
     scan: bool = False,
     bcg_adjust: bool = True,
     curvature: CurvatureCorrection | None = None,
@@ -115,7 +115,7 @@ def extract_signal(
     bcg:
         Background image (``(height, width)``) or ``0`` for none.
     scan_nbrs:
-        Optional 1-based frame indices to include (``0`` = all).
+        Optional 0-based frame indices to include (``None`` = all).
     scan:
         When true, keep one signal plane per file rather than one grand sum.
     bcg_adjust:
@@ -159,13 +159,13 @@ def extract_signal(
         hist = {k: np.zeros(NBINS, dtype=np.int64)
                 for k in ("xray", "bkg_free", "binned", "raw", "background")}
 
-    counter = 0  # 1-based global frame index
+    counter = -1  # 0-based global frame index
     for file_idx, sif in enumerate(files):
         if verbose:
             print(f"({file_idx + 1}/{len(files)}) Analyzing: {sif.path}")
         for i in range(sif.num_frames):
             counter += 1
-            i_scan = counter - 1  # 0-based column into total_counts
+            i_scan = counter  # 0-based column into total_counts
             if counter not in selected:
                 continue
 
@@ -237,11 +237,11 @@ def extract_signal(
 
 
 def _selected_frames(scan_nbrs, total_frames) -> set[int]:
-    if scan_nbrs is None or (isinstance(scan_nbrs, int) and scan_nbrs == 0):
-        return set(range(1, total_frames + 1))
+    if scan_nbrs is None or (hasattr(scan_nbrs, "__len__") and len(scan_nbrs) == 0):
+        return set(range(total_frames))
     if isinstance(scan_nbrs, int):
         return {scan_nbrs}
     arr = np.asarray(list(scan_nbrs))
     if arr.dtype == bool:
-        return set(np.flatnonzero(arr) + 1)
+        return set(np.flatnonzero(arr))
     return set(int(x) for x in arr)

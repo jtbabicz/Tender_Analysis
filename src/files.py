@@ -15,7 +15,7 @@ from collections.abc import Iterable
 from natsort import natsorted
 
 
-def find_sif_files(files: str | Iterable[str], file_nbrs=0) -> list[str]:
+def find_sif_files(files: str | Iterable[str], file_nbrs=None) -> list[str]:
     """Return a naturally-sorted list of ``.sif`` paths.
 
     Parameters
@@ -25,8 +25,8 @@ def find_sif_files(files: str | Iterable[str], file_nbrs=0) -> list[str]:
         explicit paths.  A pattern with no ``.sif`` suffix has ``*.sif`` behaviour
         applied so ``"scan_"`` matches ``scan_*.sif``.
     file_nbrs:
-        Optional 1-based indices (MATLAB convention) selecting a subset of the
-        discovered files.  ``0`` / empty means "all".
+        Optional 0-based indices selecting a subset of the discovered files.
+        ``None`` / empty means "all".
 
     Raises
     ------
@@ -58,7 +58,7 @@ def find_sif_files(files: str | Iterable[str], file_nbrs=0) -> list[str]:
     if _is_set(file_nbrs):
         idx = _as_indices(file_nbrs)
         try:
-            flist = [flist[i - 1] for i in idx]  # MATLAB indices are 1-based
+            flist = [flist[i] for i in idx]  # 0-based indices
         except IndexError as exc:
             raise IndexError(f"file_nbrs {file_nbrs} out of range for {len(flist)} files") from exc
 
@@ -69,7 +69,7 @@ def _is_set(file_nbrs) -> bool:
     if file_nbrs is None:
         return False
     if isinstance(file_nbrs, int):
-        return file_nbrs != 0
+        return True
     return len(file_nbrs) > 0
 
 

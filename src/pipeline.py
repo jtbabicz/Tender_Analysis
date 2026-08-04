@@ -90,7 +90,7 @@ class OnePot:
     bcg_adjust:
         Per-frame common-mode scaling of the background.
     file_nbrs / scan_nbrs:
-        Optional 1-based file / frame subset selectors.
+        Optional 0-based file / frame subset selectors (``None`` = all).
     """
 
     def __init__(
@@ -101,8 +101,8 @@ class OnePot:
         evolution: bool = False,
         scan: bool = False,
         bcg_adjust: bool = True,
-        file_nbrs=0,
-        scan_nbrs=0,
+        file_nbrs=None,
+        scan_nbrs=None,
         histograms: bool = False,
     ):
         self.files = files
@@ -242,7 +242,7 @@ class OnePotRIXS(OnePot):
     """
 
     def __init__(self, files, threshold=None, bcg=None, bcg_adjust=True,
-                 file_nbrs=0, scan_nbrs=0, exclude_dark=True, dark_suffix="_dark",
+                 file_nbrs=None, scan_nbrs=None, exclude_dark=True, dark_suffix="_dark",
                  use_dark_as_background=False):
         super().__init__(files, threshold=threshold, bcg=bcg, evolution=False,
                          scan=True, bcg_adjust=bcg_adjust,

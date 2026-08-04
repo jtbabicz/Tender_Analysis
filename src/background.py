@@ -19,7 +19,7 @@ from .sif_io import SifFile
 
 def compute_background(
     files: Iterable[SifFile],
-    scan_nbrs=0,
+    scan_nbrs=None,
     subtract_common_mode: bool = True,
 ) -> np.ndarray:
     """Compute the common background image from a set of SIF files.
@@ -29,8 +29,8 @@ def compute_background(
     files:
         Iterable of :class:`~onepot.sif_io.SifFile`.
     scan_nbrs:
-        Optional 1-based frame indices (across the concatenated frame stream) to
-        include; ``0``/empty means all frames.
+        Optional 0-based frame indices (across the concatenated frame stream) to
+        include; ``None``/empty means all frames.
     subtract_common_mode:
         Subtract each frame's zero peak before taking the minimum (default, as in
         the MATLAB code).
@@ -58,7 +58,7 @@ def compute_background(
     total_common_mode = 0.0
     n_used = 0
 
-    counter = 0  # 1-based global frame index, matching MATLAB
+    counter = -1  # 0-based global frame index
     for sif in files:
         for i in range(sif.num_frames):
             counter += 1
@@ -80,12 +80,12 @@ def compute_background(
 
 
 def _selected_frames(scan_nbrs, total_frames) -> set[int]:
-    """Resolve ``scan_nbrs`` to a set of 1-based frame indices."""
-    if scan_nbrs is None or (isinstance(scan_nbrs, int) and scan_nbrs == 0):
-        return set(range(1, total_frames + 1))
+    """Resolve ``scan_nbrs`` to a set of 0-based frame indices."""
+    if scan_nbrs is None or (hasattr(scan_nbrs, "__len__") and len(scan_nbrs) == 0):
+        return set(range(total_frames))
     if isinstance(scan_nbrs, int):
         return {scan_nbrs}
     arr = np.asarray(list(scan_nbrs))
     if arr.dtype == bool:
-        return set(np.flatnonzero(arr) + 1)
+        return set(np.flatnonzero(arr))
     return set(int(x) for x in arr)
