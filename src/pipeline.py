@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclasses_field
 
 import numpy as np
 from scipy.optimize import curve_fit
 
-from .analyze import XESResult, extract_signal
+from .analyze import XESResult, extract_signal, format_meta_header
 from .background import compute_background
 from .curvature import CurvatureCorrection
 from .files import find_sif_files
@@ -68,6 +68,32 @@ class RIXSResult:
     TFY: np.ndarray        # total fluorescence yield vs E
     central_pix: int       # emission-line centre used for the band
     rixs_map: np.ndarray   # (pixel, energy) map the line-out came from
+    meta: dict = dataclasses_field(default_factory=dict)  # provenance for exports
+
+    def save_txt(self, path: str, save_map: bool = False) -> list[str]:
+        """Write the HERFD/TFY line-outs to ``path`` as commented-header text.
+
+        Columns: ``energy``, ``HERFD``, ``TFY``. With ``save_map=True`` the full
+        ``(pixel, energy)`` RIXS map is also written to ``<path stem>_map.txt``.
+        Returns the list of paths written.
+        """
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        cols = np.column_stack([self.E, self.HERFD, self.TFY])
+        header = format_meta_header(
+            self.meta, extra={"central_pix": self.central_pix,
+                              "columns": "energy_eV HERFD TFY"})
+        np.savetxt(path, cols, header=header, fmt="%.8g")
+        written = [path]
+        if save_map:
+            stem, ext = os.path.splitext(path)
+            map_path = f"{stem}_map{ext or '.txt'}"
+            map_header = format_meta_header(
+                self.meta,
+                extra={"content": "RIXS map (rows=emission pixel, cols=incident energy)",
+                       "energies_eV": np.array2string(self.E, precision=2)})
+            np.savetxt(map_path, self.rixs_map, header=map_header, fmt="%.8g")
+            written.append(map_path)
+        return written
 
 
 class OnePot:
@@ -193,7 +219,28 @@ class OnePot:
                          for i in range(result.signal.shape[0])]
             result.scan_data = np.array(scan_cols).T  # (width, n_files)
 
+        result.meta = self._provenance()
         return result
+
+    def _provenance(self) -> dict:
+        """Provenance dict recorded on the result for text exports."""
+        return {
+            "pipeline": type(self).__name__,
+            "n_files": len(self._paths or []),
+            "source_files": [os.path.basename(p) for p in (self._paths or [])],
+            "thresholds [bcg_cutoff, low, xray, hi]":
+                np.array2string(self.thresholds.as_array(), precision=1),
+            "background": self._bcg_description(),
+            "bcg_adjust": self.bcg_adjust,
+            "evolution": self.evolution,
+        }
+
+    def _bcg_description(self) -> str:
+        if self.bcg_input is None:
+            return "computed from data (min-projection)"
+        if np.isscalar(self.bcg_input):
+            return "none" if self.bcg_input == 0 else f"scalar {self.bcg_input}"
+        return "supplied array"
 
     # -- energy axis helpers (shared with RIXS) ---------------------------
 
@@ -243,10 +290,11 @@ class OnePotRIXS(OnePot):
 
     def __init__(self, files, threshold=None, bcg=None, bcg_adjust=True,
                  file_nbrs=None, scan_nbrs=None, exclude_dark=True, dark_suffix="_dark",
-                 use_dark_as_background=False):
-        super().__init__(files, threshold=threshold, bcg=bcg, evolution=False,
+                 use_dark_as_background=False, evolution=False, histograms=False):
+        super().__init__(files, threshold=threshold, bcg=bcg, evolution=evolution,
                          scan=True, bcg_adjust=bcg_adjust,
-                         file_nbrs=file_nbrs, scan_nbrs=scan_nbrs)
+                         file_nbrs=file_nbrs, scan_nbrs=scan_nbrs,
+                         histograms=histograms)
         self.exclude_dark = exclude_dark
         self.dark_suffix = dark_suffix
         self.use_dark_as_background = use_dark_as_background
@@ -329,12 +377,21 @@ class OnePotRIXS(OnePot):
         TFY = rixs.sum(axis=0)
 
         order = np.argsort(E)
+        meta = dict(result.meta)
+        meta.update({
+            "herfd_band_width_px": n,
+            "central_pix": int(central_pix),
+            "i0_corrected": i0_corr,
+            "exclude_dark": self.exclude_dark,
+            "use_dark_as_background": self.use_dark_as_background,
+        })
         return RIXSResult(
             E=E[order],
             HERFD=HERFD[order],
             TFY=TFY[order],
             central_pix=int(central_pix),
             rixs_map=rixs[:, order],
+            meta=meta,
         )
 
 

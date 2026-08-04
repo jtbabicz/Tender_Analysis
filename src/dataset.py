@@ -1,0 +1,566 @@
+"""Beamtime directory indexing and measurement grouping.
+
+A finalized beamtime directory holds many *measurements* mixed together: XES
+emission scans (fixed incident energy, one or more scan indices, each with a
+paired dark) and RIXS scans (a full incident-energy series with one dark). The
+:class:`OnePot` / :class:`OnePotRIXS` pipelines each analyze a single
+measurement, so this module supplies the missing layer: parse the ``.sif``
+filenames into structured records and group them into runnable
+:class:`Measurement` objects, each of which instantiates the right pipeline
+(with auto-paired darks wired in as the background).
+
+The filename parser (:func:`parse_sif_name` and its token tables) is adapted
+from ``tender/build_report.py::parse_name`` -- the reference parser that has
+classified thousands of datasets across every tender beamtime. Only the parts
+needed to *run* analysis are copied here (line/technique/energy/dark/aux
+detection); the element-inference and compound-stem logic from that script is
+intentionally left out. If the beamline naming conventions evolve, reconcile
+the two.
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import re
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+from natsort import natsorted
+
+from .pipeline import OnePot, OnePotRIXS
+from .sif_io import SifFile
+
+# -- filename grammar (lifted from tender/build_report.py) ----------------
+
+# Emission-line tokens, longest first so ``Ka12`` beats ``Ka``.
+LINE_TOKENS = [
+    "L3_val", "L3val", "L2val", "Ka12",
+    "Ka", "Kb", "La", "Lb", "Ma", "Mb",
+]
+LINE_RE = re.compile(
+    r"(?:^|[_\-])([A-Z][a-z]?)?(" + "|".join(LINE_TOKENS) + r")(?=RIXS|XES|HERFD|[_\-.]|$)"
+)
+
+# Auxiliary / calibration keywords (plain substring match on the lowercased core).
+AUX_KEYWORDS = ["elastic", "alignment", "align", "background", "bkg",
+                "test", "pgm", "calib", "reference_grid", "focus", "belowedge"]
+
+# Commissioning / spectrometer-alignment patterns (case-insensitive regex).
+AUX_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r"rowland", r"(?:^|_)dy_?scan", r"(?:^|_)dy[+\-]\d", r"(?:^|_)dx[+\-]\d",
+        r"(?:^|_)example\d", r"(?:^|_)windows?_\d+deg", r"noshutter",
+        r"(?:^|_)slit\d", r"m0slit",
+    )
+]
+
+# Operando echem naming (non-standard / unstandardized -> skipped by default).
+ECHEM_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r"electrolyte", r"hclo4", r"h2so4", r"(?:^|[_\-])ocv",
+        r"[_\-]\d?[pP]?\d*[Vv](?=_|$)",       # applied potential 0p4V 1P2V
+        r"(?:^|[_\-])E\d{1,2}(?=_|$)",        # electrode / cell id E2..E6
+        r"echem",
+    )
+]
+
+ENERGY_RE = re.compile(r"(\d{4}(?:\.\d+)?)")
+_EV_RE = re.compile(r"(\d{4}(?:\.\d+)?)\s*eV", re.IGNORECASE)
+_TECH_RE = re.compile(r"(RIXS|RXES|HERFD|XES)", re.IGNORECASE)
+# Trailing scan / series indices in the two schemas.
+_XES_SCAN_RE = re.compile(r"_(\d{1,3})$")               # ..._<energy>eV_05
+_RIXS_SERIES_RE = re.compile(r"_RIXS_(\d{1,3})(?=_|$)", re.IGNORECASE)
+
+# When no technique token is present, treat a group spanning this many distinct
+# incident energies as an energy scan (RIXS). Mirrors build_report.py.
+_RIXS_ENERGY_THRESHOLD = 5
+
+
+@dataclass
+class FileRecord:
+    """One parsed ``.sif`` filename."""
+
+    path: str
+    sample: str                       # sample + conditions label
+    emission_line: str | None         # e.g. "Ka", "L3val" (None if absent)
+    technique_token: str | None       # explicit RIXS/XES/HERFD token, if named
+    energy: float | None              # incident energy (eV), if found
+    scan_index: int | None            # trailing XES scan index
+    series_index: int | None          # RIXS series index
+    is_dark: bool
+    is_aux: bool
+    is_echem: bool
+    kind: str | None = None           # "XES"/"RIXS", set by _assign_kinds
+
+
+def parse_sif_name(path: str) -> FileRecord | None:
+    """Decode one ``.sif`` path into a :class:`FileRecord` (``None`` if not a sif).
+
+    Adapted from ``tender/build_report.py::parse_name``. The sample label is the
+    filename with the energy / technique / emission-line / dark tokens stripped
+    out; if nothing is left it falls back to the parent directory name.
+    """
+    name = os.path.basename(path)
+    if not name.lower().endswith(".sif"):
+        return None
+    base = name[:-4]
+    low = base.lower()
+
+    is_dark = bool(re.search(r"_?dark$", low))
+    core = re.sub(r"_?dark$", "", base, flags=re.IGNORECASE)
+    low_core = core.lower()
+    is_aux = (any(k in low_core for k in AUX_KEYWORDS)
+              or any(p.search(core) for p in AUX_PATTERNS))
+    is_echem = any(p.search(core) for p in ECHEM_PATTERNS)
+
+    # explicit technique token, if present
+    if "rixs" in low_core or "rxes" in low_core:
+        technique_token = "RIXS"
+    elif "herfd" in low_core:
+        technique_token = "HERFD"
+    elif "xes" in low_core:
+        technique_token = "XES"
+    else:
+        technique_token = None
+
+    # RIXS series index (from the ``_RIXS_<n>_`` token)
+    ms = _RIXS_SERIES_RE.search(core)
+    series_index = int(ms.group(1)) if ms else None
+
+    # emission line (ignore an optional element prefix, which we don't need here)
+    m = LINE_RE.search(core)
+    emission_line = _norm_line(m.group(2)) if m else None
+
+    # incident energy: prefer an ``eV``-tagged value, else an in-range 4-digit
+    # token. Scan from the END: a leading ``YYMMDD`` date (e.g. ``250615`` ->
+    # ``2506``) can fall in range, but the real (RIXS) energy sits at the tail.
+    # (Latent edge: a *trailing* 4-digit date/timestamp after the energy in an
+    # un-eV-tagged name would be picked instead; no such convention exists today.)
+    energy = None
+    mev = _EV_RE.search(core)
+    if mev:
+        energy = float(mev.group(1))
+    else:
+        for e in reversed(ENERGY_RE.findall(core)):
+            f = float(e)
+            if 1900 < f < 4300:
+                energy = f
+                break
+
+    # sample + conditions label: strip energy / technique / line tokens.
+    # Remove the ``_RIXS_<n>_`` series token as a unit *before* the generic
+    # technique strip, so the series number isn't left orphaned in the label.
+    label = core
+    label = _EV_RE.sub("", label)
+    # Strip the series token with the SAME boundary-guarded pattern used for
+    # detection (`_RIXS_SERIES_RE`, which requires ``_``/end after the digits).
+    # A plain ``_RIXS_\d{1,3}`` would eat the leading digits of a bare energy in
+    # names like ``..._RIXS_2825.00.sif`` (RIXS with no series index).
+    label = _RIXS_SERIES_RE.sub("", label)
+    label = _TECH_RE.sub("", label)
+    if m:
+        # Strip the emission-line token from ``label`` directly; do NOT slice with
+        # ``m.start()``/``m.end()`` -- those offsets index into ``core``, but
+        # ``label`` has already been shortened above, so slicing corrupts it.
+        label = LINE_RE.sub("_", label, count=1)
+    label = re.sub(r"_\d{4}(\.\d+)?(?=_|$)", "", label)   # leftover bare energy
+    label = re.sub(r"[_\-]{2,}", "_", label).strip("_- ")
+
+    # XES trailing scan index (only meaningful once the label is cleaned up, and
+    # only for XES -- a RIXS file's trailing index is its series, handled above)
+    scan_index = None
+    if series_index is None:
+        msc = _XES_SCAN_RE.search(label)
+        if msc:
+            scan_index = int(msc.group(1))
+            label = _XES_SCAN_RE.sub("", label).strip("_- ")
+
+    if not label or re.fullmatch(r"\d+", label):
+        dirbase = os.path.basename(os.path.dirname(path))
+        dirbase = re.sub(r"(?i)_(RXES|RIXS|XES|HERFD)$", "", dirbase)
+        # Guarantee a non-empty label so unrelated files never collapse under
+        # ``sample==''``: prefer the (cleaned) directory name, else the filename.
+        label = dirbase or label or base
+
+    return FileRecord(
+        path=path, sample=label, emission_line=emission_line,
+        technique_token=technique_token, energy=energy, scan_index=scan_index,
+        series_index=series_index, is_dark=is_dark, is_aux=is_aux,
+        is_echem=is_echem,
+    )
+
+
+def _norm_line(tok: str) -> str:
+    return {"L3_val": "L3val"}.get(tok, tok)
+
+
+def _as_list(paths) -> list[str]:
+    """Normalize a save_txt return (str or list) to a list of paths."""
+    return [paths] if isinstance(paths, str) else list(paths)
+
+
+@dataclass
+class Measurement:
+    """A group of ``.sif`` files that make up one runnable analysis.
+
+    ``kind`` is ``"XES"`` (fixed incident energy, scans summed) or ``"RIXS"``
+    (an incident-energy series). ``data_paths`` are the signal files and
+    ``dark_paths`` the auto-paired dark(s) used as the background.
+    """
+
+    kind: str
+    sample: str
+    emission_line: str | None
+    incident_energy: float | None      # XES: fixed value; RIXS: None (a series)
+    series_index: int | None
+    data_paths: list[str] = field(default_factory=list)
+    dark_paths: list[str] = field(default_factory=list)
+
+    # -- construction of the underlying pipeline --------------------------
+
+    def pipeline(self, **overrides):
+        """Return a configured :class:`OnePot` / :class:`OnePotRIXS`.
+
+        Darks are wired in automatically: XES passes the frame-averaged dark as
+        ``bcg``; RIXS uses ``use_dark_as_background=True``. Any keyword override
+        (``threshold``, ``bcg``, ...) takes precedence.
+        """
+        if self.kind == "RIXS":
+            # Hand every file (data + dark) to OnePotRIXS; it separates the dark
+            # itself. Prefer the dark as background when exactly one is present.
+            kw = dict(use_dark_as_background=(len(self.dark_paths) == 1))
+            kw.update(overrides)
+            if "bcg" in kw and kw["bcg"] is not None:
+                kw.pop("use_dark_as_background", None)  # explicit bcg wins
+            return OnePotRIXS(self.data_paths + self.dark_paths, **kw)
+
+        kw = dict(overrides)
+        if "bcg" not in kw and self.dark_paths:
+            kw["bcg"] = self._dark_background()
+        return OnePot(self.data_paths, **kw)
+
+    #: HERFD/RIXS-only keywords, consumed by :meth:`OnePotRIXS.herfd`.
+    _HERFD_KEYS = ("central_pix", "n", "i0_corr")
+
+    def run(self, **overrides):
+        """Instantiate the pipeline and execute it.
+
+        XES returns an ``XESResult`` (from ``OnePot.run``); RIXS returns a
+        ``RIXSResult`` (from ``OnePotRIXS.herfd``). ``herfd`` keywords
+        (``central_pix``, ``n``, ``i0_corr``) apply to RIXS; they are split out
+        here and *ignored* for XES, so a single ``run_all(central_pix=...)`` over
+        a mixed beamtime doesn't blow up the XES measurements.
+        """
+        herfd_kw = {k: overrides.pop(k) for k in self._HERFD_KEYS if k in overrides}
+        if self.kind == "RIXS":
+            return self.pipeline(**overrides).herfd(**herfd_kw)
+        return self.pipeline(**overrides).run()
+
+    def _dark_background(self) -> np.ndarray:
+        """Frame-averaged mean of the paired dark file(s).
+
+        NOTE: for XES this averages *all* darks paired to the measurement (e.g.
+        one dark per scan index at this incident energy) into a single background
+        image. This assumes the dark is stationary across the scans. Revisit
+        per-scan dark pairing if a systematic drift appears between early and
+        late scans (S/N change, beamline drift) -- see ``_group_xes``.
+        """
+        frames = [SifFile(p).data.mean(axis=0) for p in self.dark_paths]
+        return np.mean(frames, axis=0)
+
+    # -- naming for exports ----------------------------------------------
+
+    def label(self) -> str:
+        """Filesystem-safe stem from the measurement metadata."""
+        parts = [self.sample, self.emission_line or "", self.kind]
+        if self.kind == "XES" and self.incident_energy is not None:
+            parts.append(f"{self.incident_energy:g}eV")
+        elif self.kind == "RIXS" and self.series_index is not None:
+            parts.append(f"{self.series_index:02d}")
+        stem = "_".join(p for p in parts if p)
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
+
+    def save_result(self, result, root: str, *, subdir: str = "analysis",
+                    **save_kwargs) -> list[str]:
+        """Auto-name ``result`` into ``root`` and write it via ``result.save_txt``.
+
+        The filename is built from this measurement's metadata (see :meth:`label`)
+        and written under ``root/<subdir>/`` (set ``subdir=""`` to write directly
+        into ``root``). Use this for whole-beamtime batch runs; for a one-off
+        explicit path call ``result.save_txt(path)`` directly. Returns the paths
+        written.
+        """
+        out_dir = os.path.join(root, subdir) if subdir else root
+        path = os.path.join(out_dir, self.label() + ".txt")
+        # ``save_map`` is a RIXS-only knob; drop it for XES so a batch call like
+        # ``run_all(save_kwargs={"save_map": True})`` over a mixed beamtime
+        # doesn't raise on the XES results (whose save_txt takes only ``path``).
+        if self.kind != "RIXS":
+            save_kwargs = {k: v for k, v in save_kwargs.items() if k != "save_map"}
+        return _as_list(result.save_txt(path, **save_kwargs))
+
+    def __repr__(self) -> str:
+        e = (f"{self.incident_energy:g}eV" if self.incident_energy is not None
+             else f"series {self.series_index}")
+        return (f"Measurement({self.kind}, {self.sample!r}, "
+                f"{self.emission_line}, {e}, "
+                f"{len(self.data_paths)} files, {len(self.dark_paths)} dark)")
+
+
+@dataclass
+class MeasurementRun:
+    """Outcome of running one :class:`Measurement`.
+
+    ``result`` is the ``XESResult`` / ``RIXSResult`` on success (``None`` on
+    failure); ``error`` holds the exception when a measurement raised;
+    ``seconds`` is the wall-clock analysis time.
+    """
+
+    measurement: Measurement
+    result: object | None = None
+    seconds: float = 0.0
+    error: Exception | None = None
+    saved_paths: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def run_measurement(m: Measurement, *, save_root: str | None = None,
+                    save_kwargs: dict | None = None,
+                    **overrides) -> MeasurementRun:
+    """Run a single measurement and wrap the outcome in a :class:`MeasurementRun`.
+
+    This is the one unit of work behind :meth:`BeamtimeIndex.run_all` -- kept as a
+    standalone function so it can later be dispatched to a process/thread pool
+    without touching callers. Exceptions are captured on the returned record
+    rather than raised, so one bad measurement doesn't abort a batch.
+    """
+    t0 = time.perf_counter()
+    try:
+        result = m.run(**overrides)
+        run = MeasurementRun(measurement=m, result=result,
+                             seconds=time.perf_counter() - t0)
+        if save_root is not None:
+            run.saved_paths = m.save_result(result, root=save_root,
+                                            **(save_kwargs or {}))
+        return run
+    except Exception as exc:  # noqa: BLE001 -- batch robustness, re-surfaced on the record
+        return MeasurementRun(measurement=m, error=exc,
+                              seconds=time.perf_counter() - t0)
+
+
+@dataclass
+class BeamtimeIndex:
+    """Result of :func:`index_beamtime`: measurements plus a skipped-file bucket."""
+
+    measurements: list[Measurement]
+    skipped: dict[str, list[str]] = field(default_factory=dict)  # reason -> paths
+
+    def __iter__(self):
+        return iter(self.measurements)
+
+    def __len__(self):
+        return len(self.measurements)
+
+    def by_kind(self, kind: str) -> list[Measurement]:
+        return [m for m in self.measurements if m.kind == kind]
+
+    def run_all(self, *, save_root: str | None = None, save_kwargs: dict | None = None,
+                verbose: bool = True, **overrides) -> list[MeasurementRun]:
+        """Run every measurement in the index and return a list of outcomes.
+
+        Parameters
+        ----------
+        save_root:
+            If given, each result is auto-named and written under
+            ``save_root/analysis/`` via :meth:`Measurement.save_result`.
+        save_kwargs:
+            Extra keywords forwarded to ``save_result`` (e.g. ``save_map=True``).
+        verbose:
+            Print a per-measurement progress line (name, time, status) and a
+            closing summary (default ``True``).
+        **overrides:
+            Pipeline overrides passed through to :meth:`Measurement.run`
+            (e.g. ``threshold=[100, 170, 350]``, ``scan_nbrs=range(20)``,
+            ``central_pix=1280`` for RIXS).
+
+        Notes
+        -----
+        Measurements run sequentially; a failure is captured on its
+        :class:`MeasurementRun` (``error``) instead of aborting the batch. Each
+        run is dispatched through :func:`run_measurement`, the single unit of
+        work intended for future parallel execution.
+        """
+        runs: list[MeasurementRun] = []
+        n = len(self.measurements)
+        if verbose:
+            print(f"Running {n} measurement(s)...")
+        for i, m in enumerate(self.measurements, 1):
+            run = run_measurement(m, save_root=save_root, save_kwargs=save_kwargs,
+                                  **overrides)
+            runs.append(run)
+            if verbose:
+                if run.ok:
+                    saved = (f"  -> {len(run.saved_paths)} file(s)"
+                             if run.saved_paths else "")
+                    print(f"  [{i}/{n}] {m.label():52s} {run.seconds:6.1f}s  ok{saved}")
+                else:
+                    print(f"  [{i}/{n}] {m.label():52s} {run.seconds:6.1f}s  "
+                          f"FAILED: {type(run.error).__name__}: {run.error}")
+        if verbose:
+            n_ok = sum(r.ok for r in runs)
+            total = sum(r.seconds for r in runs)
+            print(f"Done: {n_ok}/{n} succeeded in {total:.1f}s"
+                  + (f" ({n - n_ok} failed)" if n_ok < n else ""))
+        return runs
+
+
+def index_beamtime(directory: str, *, skip_echem: bool = True,
+                   skip_aux: bool = True, recursive: bool = False) -> BeamtimeIndex:
+    """Index a beamtime directory into runnable :class:`Measurement` groups.
+
+    Parameters
+    ----------
+    directory:
+        Folder holding ``.sif`` files (or a glob pattern).
+    skip_echem:
+        Drop operando-echem measurements (non-standard naming) (default True).
+    skip_aux:
+        Drop calibration / alignment / test files (default True).
+    recursive:
+        Recurse into subdirectories (default False).
+
+    Returns
+    -------
+    BeamtimeIndex
+        ``.measurements`` are the grouped runnable units; ``.skipped`` buckets
+        the files that were not grouped (keys: ``"aux"``, ``"echem"``,
+        ``"unparsed"``, ``"no_energy"``) so nothing is silently dropped.
+    """
+    if glob.has_magic(directory):
+        paths = glob.glob(directory, recursive=recursive)
+    elif recursive:
+        paths = glob.glob(os.path.join(directory, "**", "*.sif"), recursive=True)
+    else:
+        paths = glob.glob(os.path.join(directory, "*.sif"))
+
+    records: list[FileRecord] = []
+    skipped: dict[str, list[str]] = {}
+
+    def _skip(reason: str, path: str) -> None:
+        skipped.setdefault(reason, []).append(path)
+
+    # Natural sort (foo_2 before foo_10), matching find_sif_files / the rest of
+    # the package rather than plain lexical ordering.
+    for p in natsorted(paths):
+        rec = parse_sif_name(p)
+        if rec is None:
+            _skip("unparsed", p)
+            continue
+        if skip_aux and rec.is_aux:
+            _skip("aux", p)
+            continue
+        if skip_echem and rec.is_echem:
+            _skip("echem", p)
+            continue
+        records.append(rec)
+
+    darks = [r for r in records if r.is_dark]
+    data = [r for r in records if not r.is_dark]
+
+    _assign_kinds(data)  # sets rec.kind on each record
+    measurements: list[Measurement] = []
+    measurements += _group_rixs([r for r in data if r.kind == "RIXS"], darks)
+    measurements += _group_xes([r for r in data if r.kind == "XES"], darks, _skip)
+
+    measurements.sort(key=lambda m: (m.kind, m.sample, m.emission_line or "",
+                                     m.incident_energy or 0,
+                                     m.series_index or 0))
+    return BeamtimeIndex(measurements=measurements, skipped=skipped)
+
+
+def _assign_kinds(data: list[FileRecord]) -> None:
+    """Set ``rec.kind`` (``"XES"``/``"RIXS"``) on each record in place.
+
+    Explicit technique token wins. Otherwise a ``(sample, emission_line)`` group
+    spanning >= ``_RIXS_ENERGY_THRESHOLD`` distinct incident energies is an
+    energy scan (RIXS); anything else is XES.
+    """
+    from collections import defaultdict
+
+    groups: dict[tuple, list[FileRecord]] = defaultdict(list)
+    for r in data:
+        groups[(r.sample, r.emission_line)].append(r)
+
+    for grp in groups.values():
+        untok = [r for r in grp if r.technique_token is None]
+        distinct_e = {r.energy for r in untok if r.energy is not None}
+        scan = len(distinct_e) >= _RIXS_ENERGY_THRESHOLD
+        for r in grp:
+            if r.technique_token in ("RIXS", "HERFD"):
+                r.kind = "RIXS"
+            elif r.technique_token == "XES":
+                r.kind = "XES"
+            else:
+                r.kind = "RIXS" if scan else "XES"
+
+
+def _group_rixs(data: list[FileRecord],
+                darks: list[FileRecord]) -> list[Measurement]:
+    """Group RIXS records into one measurement per (sample, line, series)."""
+    from collections import defaultdict
+
+    groups: dict[tuple, list[FileRecord]] = defaultdict(list)
+    for r in data:
+        groups[(r.sample, r.emission_line, r.series_index)].append(r)
+
+    out = []
+    for (sample, line, series), recs in groups.items():
+        dpaths = [d.path for d in darks
+                  if d.sample == sample and d.emission_line == line
+                  and d.series_index == series]
+        out.append(Measurement(
+            kind="RIXS", sample=sample, emission_line=line,
+            incident_energy=None, series_index=series,
+            data_paths=natsorted(r.path for r in recs), dark_paths=natsorted(dpaths),
+        ))
+    return out
+
+
+def _group_xes(data: list[FileRecord], darks: list[FileRecord],
+               skip) -> list[Measurement]:
+    """Group XES records into one measurement per (sample, line, energy)."""
+    from collections import defaultdict
+
+    groups: dict[tuple, list[FileRecord]] = defaultdict(list)
+    for r in data:
+        if r.energy is None:
+            skip("no_energy", r.path)
+            continue
+        groups[(r.sample, r.emission_line, round(r.energy, 2))].append(r)
+
+    out = []
+    for (sample, line, energy), recs in groups.items():
+        # Pair darks by matching sample/line/energy; fall back to scan-index match.
+        # All darks matched here are collected together and averaged into one
+        # background image by Measurement._dark_background (i.e. per-scan darks
+        # are NOT kept separate). This is fine when the dark is stationary; if a
+        # systematic scan-to-scan change shows up, switch to per-scan pairing.
+        scan_idxs = {r.scan_index for r in recs}
+        dpaths = [d.path for d in darks
+                  if d.sample == sample and d.emission_line == line
+                  and (d.energy is not None and round(d.energy, 2) == energy)]
+        if not dpaths:
+            dpaths = [d.path for d in darks
+                      if d.sample == sample and d.emission_line == line
+                      and d.scan_index in scan_idxs]
+        out.append(Measurement(
+            kind="XES", sample=sample, emission_line=line,
+            incident_energy=energy, series_index=None,
+            data_paths=natsorted(r.path for r in recs), dark_paths=natsorted(dpaths),
+        ))
+    return out

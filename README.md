@@ -6,8 +6,9 @@ Orginally written by Tsu-Chien Weng and Stanislaw Nowak.<sup>1,2</sup>
 2. Nowak, S. H. et al. A versatile Johansson-type tender x-ray emission spectrometer. Review of Scientific Instruments 91, 033101 (2020). DOI: 10.1063/1.5121853
 
 The example notebook `Tender_Analysis_Example.ipynb` walks through reading a SIF
-file, the `OnePot` XES pipeline, ADU-threshold diagnostics, and the `OnePotRIXS`
-HERFD/XAS workflow. Two sample datasets are bundled under `data/`:
+file, the `OnePot` XES pipeline, ADU-threshold diagnostics, the `OnePotRIXS`
+HERFD/XAS workflow, and batch-processing a whole beamtime directory with
+`index_beamtime`. Two sample datasets are bundled under `data/`:
 
 - `data/Na2SO4/` — sulfur K RIXS energy scan (Na<sub>2</sub>SO<sub>4</sub> pellet).
 - `data/CPMoITriCO3Dimer/` — Mo L<sub>3</sub> valence-to-core XES of the
@@ -26,6 +27,7 @@ The package lives in `src/`. Modules port the MATLAB routines one-to-one:
 | `analyze.py`    | `sifAnalyze.m`          | `extract_signal()`: single-photon event extraction   |
 | `curvature.py`  | `sifAutoCorrelation.m`  | `CurvatureCorrection`: banana-shape fit + apply      |
 | `pipeline.py`   | `onepot.m`, `onepotRIXS.m`| `OnePot` / `OnePotRIXS` orchestrators              |
+| `dataset.py`    | (new)                   | `index_beamtime()`: group a directory into runnable `Measurement`s and batch-run them |
 
 ## Orientation convention
 
@@ -36,12 +38,23 @@ collapses the MATLAB double-transpose into one documented convention — see
 
 ## Usage
 
+There are two levels of entry point:
+
+- **`OnePot` / `OnePotRIXS`** — analyze a *single* measurement from an explicit
+  set of files (you choose the background and options).
+- **`index_beamtime`** — scan a *directory*, group the files into measurements,
+  and run them in batch. It builds `OnePot` / `OnePotRIXS` under the hood, so it
+  layers on top of the single-measurement API rather than replacing it.
+
+### Single measurement
+
 The public API is exported from the `src` package (as imported in the notebook):
 
 ```python
 from src import (
     SifFile, find_sif_files, compute_background,
     extract_signal, CurvatureCorrection, OnePot, OnePotRIXS,
+    index_beamtime,
 )
 
 # Read a single SIF file
@@ -68,6 +81,48 @@ array uses it directly. `evolution=True` runs the two-pass curvature workflow.
 (`exclude_dark=False` keeps them; `use_dark_as_background=True` subtracts the
 averaged dark instead of a min-projection background). `herfd(central_pix=None)`
 locates the emission-line centre by a gaussian fit.
+
+### Batch: a whole beamtime directory
+
+`index_beamtime` parses the `.sif` filenames in a directory and groups them into
+`Measurement` objects — one XES measurement per incident energy, one RIXS
+measurement per energy series — auto-pairing `*_dark.sif` files as the
+background. Calibration/alignment and operando-echem files are skipped by
+default and reported in `.skipped` (never silently dropped).
+
+```python
+idx = index_beamtime("data/CPMoITriCO3Dimer")   # -> BeamtimeIndex
+len(idx), idx.skipped                            # measurement count + skipped files
+for m in idx:
+    print(m)                                     # sample, line, technique, energy
+
+# Run one measurement (dark auto-paired as background); overrides pass through
+# to the underlying pipeline.
+result = idx.by_kind("XES")[0].run(threshold=[100, 170, 350])
+
+# Or run the whole directory in one call, saving each result to text.
+runs = idx.run_all(save_root="data/CPMoITriCO3Dimer",
+                   threshold=[100, 170, 350])     # prints progress + summary
+ok = [r for r in runs if r.ok]                    # MeasurementRun: .result/.seconds/.error
+```
+
+`run_all(**overrides)` forwards options to each pipeline by keyword (order does
+not matter); a measurement that raises is captured on its `MeasurementRun.error`
+instead of aborting the batch.
+
+### Exporting results
+
+Both result objects write annotated text (a commented header with source files,
+thresholds, and background mode, followed by data columns):
+
+```python
+result.save_txt("mo_2523.txt")                    # XES: pixel, counts
+rixs_out.save_txt("na2so4.txt", save_map=True)     # RIXS: energy, HERFD, TFY (+ _map)
+```
+
+For batch runs, `Measurement.save_result(result, root=...)` auto-names the file
+from the measurement metadata into an `analysis/` subdirectory (this is what
+`run_all(save_root=...)` calls).
 
 ## Dependencies
 

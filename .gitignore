@@ -1,3 +1,10 @@
 .ipynb_checkpoints/
 onepot_walkthrough.ipynb
 data/CPMoITriCO3Dimer/
+
+# internal scratch / testing notebooks
+scratch_*.ipynb
+
+# python bytecode
+__pycache__/
+*.pyc

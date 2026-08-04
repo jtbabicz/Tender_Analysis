@@ -9,7 +9,8 @@ the cleaned signal.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from collections.abc import Iterable
 
 import numpy as np
@@ -19,6 +20,31 @@ from scipy.signal import convolve2d
 from .common import common_mode, adu_histogram, NBINS
 from .curvature import CurvatureCorrection
 from .sif_io import SifFile
+
+
+def format_meta_header(meta: dict, extra: dict | None = None) -> str:
+    """Render a provenance dict into a multi-line text header for ``np.savetxt``.
+
+    Keys are printed one per line as ``key: value``; list values (e.g. source
+    files) are expanded across lines. ``extra`` is merged in last (used for the
+    column legend).
+    """
+    items = dict(meta or {})
+    if extra:
+        items.update(extra)
+    lines = ["Tender_Analysis export"]
+    for key, val in items.items():
+        if isinstance(val, (list, tuple)):
+            # Cap long lists (e.g. an 80-energy RIXS source list) to stay readable.
+            if len(val) > 6:
+                shown = list(val[:3]) + [f"... ({len(val) - 4} more) ..."] + [val[-1]]
+            else:
+                shown = list(val)
+            lines.append(f"{key}: ({len(val)})")
+            lines.extend(f"  {v}" for v in shown)
+        else:
+            lines.append(f"{key}: {val}")
+    return "\n".join(lines)
 
 
 def _hist_positive(values: np.ndarray) -> np.ndarray:
@@ -75,6 +101,7 @@ class XESResult:
     scan: bool = False
     scan_data: np.ndarray | None = None  # (width, n_files), filled in scan mode
     histograms: dict[str, np.ndarray] | None = None  # ADU histograms (if requested)
+    meta: dict = field(default_factory=dict)  # provenance for exports (set by OnePot)
 
     def spectrum(self) -> np.ndarray:
         """Length-``width`` summed spectrum of the (corrected) signal."""
@@ -82,6 +109,20 @@ class XESResult:
         if img.ndim == 3:
             img = img.sum(axis=0)
         return img.sum(axis=0)
+
+    def save_txt(self, path: str) -> str:
+        """Write the emission spectrum to ``path`` as commented-header text.
+
+        Two columns: ``pixel`` and ``counts``. The header records provenance from
+        :attr:`meta` (source files, thresholds, background mode, ...). Returns the
+        path written.
+        """
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        spec = self.spectrum()
+        cols = np.column_stack([np.arange(spec.size), spec])
+        header = format_meta_header(self.meta, extra={"columns": "pixel counts"})
+        np.savetxt(path, cols, header=header, fmt=["%d", "%.8g"])
+        return path
 
 
 def _background_common_mode(bcg: np.ndarray, bcg_adjust: bool) -> float:

@@ -16,6 +16,10 @@ from .background import compute_background
 from .curvature import CurvatureCorrection
 from .analyze import extract_signal, XESResult
 from .pipeline import OnePot, OnePotRIXS, Thresholds, RIXSResult
+from .dataset import (
+    index_beamtime, Measurement, FileRecord, BeamtimeIndex, parse_sif_name,
+    MeasurementRun, run_measurement,
+)
 
 __all__ = [
     "OnePot",
@@ -28,4 +32,11 @@ __all__ = [
     "compute_background",
     "extract_signal",
     "CurvatureCorrection",
+    "index_beamtime",
+    "Measurement",
+    "FileRecord",
+    "BeamtimeIndex",
+    "parse_sif_name",
+    "MeasurementRun",
+    "run_measurement",
 ]
