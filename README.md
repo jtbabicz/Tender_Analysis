@@ -8,7 +8,8 @@ Orginally written by Tsu-Chien Weng and Stanislaw Nowak.<sup>1,2</sup>
 The example notebook `Tender_Analysis_Example.ipynb` walks through reading a SIF
 file, the `OnePot` XES pipeline, ADU-threshold diagnostics, the `OnePotRIXS`
 HERFD/XAS workflow, and batch-processing a whole beamtime directory with
-`index_beamtime`. Two sample datasets are bundled under `data/`:
+`index_beamtime` (including parallel execution and a JSON run manifest). Two
+sample datasets are bundled under `data/`:
 
 - `data/Na2SO4/` — sulfur K RIXS energy scan (Na<sub>2</sub>SO<sub>4</sub> pellet).
 - `data/CPMoITriCO3Dimer/` — Mo L<sub>3</sub> valence-to-core XES of the
@@ -27,7 +28,7 @@ The package lives in `src/`. Modules port the MATLAB routines one-to-one:
 | `analyze.py`    | `sifAnalyze.m`          | `extract_signal()`: single-photon event extraction   |
 | `curvature.py`  | `sifAutoCorrelation.m`  | `CurvatureCorrection`: banana-shape fit + apply      |
 | `pipeline.py`   | `onepot.m`, `onepotRIXS.m`| `OnePot` / `OnePotRIXS` orchestrators              |
-| `dataset.py`    | (new)                   | `index_beamtime()`: group a directory into runnable `Measurement`s and batch-run them |
+| `dataset.py`    | (new)                   | `index_beamtime()` / `run_beamtimes()`: group a directory into runnable `Measurement`s, batch-run them (optionally parallel), and write a JSON manifest |
 
 ## Orientation convention
 
@@ -54,7 +55,7 @@ The public API is exported from the `src` package (as imported in the notebook):
 from src import (
     SifFile, find_sif_files, compute_background,
     extract_signal, CurvatureCorrection, OnePot, OnePotRIXS,
-    index_beamtime,
+    index_beamtime, run_beamtimes,
 )
 
 # Read a single SIF file
@@ -80,7 +81,9 @@ array uses it directly. `evolution=True` runs the two-pass curvature workflow.
 `OnePotRIXS` excludes `*_dark.sif` frames from the scan by default
 (`exclude_dark=False` keeps them; `use_dark_as_background=True` subtracts the
 averaged dark instead of a min-projection background). `herfd(central_pix=None)`
-locates the emission-line centre by a gaussian fit.
+locates the emission-line centre by a gaussian fit. `verbose=True` prints a
+progress header and a per-file line during extraction (most of a measurement's
+time is spent there).
 
 ### Batch: a whole beamtime directory
 
@@ -108,7 +111,41 @@ ok = [r for r in runs if r.ok]                    # MeasurementRun: .result/.sec
 
 `run_all(**overrides)` forwards options to each pipeline by keyword (order does
 not matter); a measurement that raises is captured on its `MeasurementRun.error`
-instead of aborting the batch.
+instead of aborting the batch. Pass `detail=True` to also stream each
+measurement's own per-file progress. When `save_root` is given, `run_all` also
+writes a JSON run manifest to `save_root/analysis/run_manifest.json` (one entry
+per measurement: label, ok/failed, output paths, timing, error) so unattended
+batch runs are auditable.
+
+### Parallel batch execution (HPC / many beamtimes)
+
+For large re-processing jobs, `run_all(max_workers=N)` runs measurements
+concurrently in a process pool (each measurement is an independent unit of
+work). Parallel mode requires `save_root`: results are written in the worker and
+their heavy arrays dropped before returning, so the batch avoids shipping large
+arrays back between processes.
+
+```python
+# Parallel over a directory (must set save_root).
+runs = idx.run_all(save_root="out/CPMoITriCO3Dimer",
+                   max_workers=8, threshold=[100, 170, 350])
+
+# Many beamtime directories in one call -> per-beamtime outputs + combined manifest.
+run_beamtimes(["beamtimes/2025-06/SampleA", "beamtimes/2025-06/SampleB"],
+              save_root="out", max_workers=8, threshold=[100, 170, 350])
+```
+
+Worker-count resolution is deliberately conservative for shared clusters: an
+explicit `max_workers` always wins; otherwise it reads the SLURM allocation
+(`SLURM_CPUS_PER_TASK`, then `SLURM_CPUS_ON_NODE`); if neither is available it
+raises rather than guess from the machine's total core count (which would
+oversubscribe a shared node). Because the pool uses the *spawn* start method, a
+plain script must guard its entry point:
+
+```python
+if __name__ == "__main__":
+    run_beamtimes([...], save_root="out", max_workers=8)
+```
 
 ### Exporting results
 
