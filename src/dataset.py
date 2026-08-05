@@ -21,9 +21,11 @@ the two.
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -314,8 +316,10 @@ class MeasurementRun:
     """Outcome of running one :class:`Measurement`.
 
     ``result`` is the ``XESResult`` / ``RIXSResult`` on success (``None`` on
-    failure); ``error`` holds the exception when a measurement raised;
-    ``seconds`` is the wall-clock analysis time.
+    failure, or when ``keep_result=False`` dropped it after saving); ``error``
+    holds the exception when a measurement raised; ``seconds`` is the wall-clock
+    analysis time; ``summary`` holds a few small scalar outputs (spectrum sum,
+    peak pixel, ...) that survive even when the heavy arrays are dropped.
     """
 
     measurement: Measurement
@@ -323,34 +327,135 @@ class MeasurementRun:
     seconds: float = 0.0
     error: Exception | None = None
     saved_paths: list[str] = field(default_factory=list)
+    summary: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
         return self.error is None
 
 
+def _result_summary(m: Measurement, result) -> dict:
+    """Small, picklable scalar summary of a result (survives array-dropping)."""
+    out = {"kind": m.kind}
+    try:
+        if m.kind == "RIXS":
+            out["central_pix"] = int(getattr(result, "central_pix", -1))
+            herfd = getattr(result, "HERFD", None)
+            if herfd is not None:
+                out["herfd_sum"] = float(np.nansum(herfd))
+        else:
+            spec = result.spectrum()
+            out["spectrum_sum"] = float(spec.sum())
+            out["peak_pixel"] = int(np.argmax(spec))
+    except Exception:  # noqa: BLE001 -- summary is best-effort, never fatal
+        pass
+    return out
+
+
 def run_measurement(m: Measurement, *, save_root: str | None = None,
-                    save_kwargs: dict | None = None,
+                    save_kwargs: dict | None = None, keep_result: bool = True,
                     **overrides) -> MeasurementRun:
     """Run a single measurement and wrap the outcome in a :class:`MeasurementRun`.
 
-    This is the one unit of work behind :meth:`BeamtimeIndex.run_all` -- kept as a
-    standalone function so it can later be dispatched to a process/thread pool
+    This is the one unit of work behind :meth:`BeamtimeIndex.run_all` -- a
+    standalone, picklable function so it can be dispatched to a process pool
     without touching callers. Exceptions are captured on the returned record
     rather than raised, so one bad measurement doesn't abort a batch.
+
+    ``keep_result=False`` drops the heavy result arrays after saving (keeping only
+    ``saved_paths`` + a small ``summary``); this is used for parallel runs, where
+    a full ``XESResult`` (~37 MB) would otherwise be pickled back to the parent.
     """
     t0 = time.perf_counter()
     try:
         result = m.run(**overrides)
         run = MeasurementRun(measurement=m, result=result,
-                             seconds=time.perf_counter() - t0)
+                             seconds=time.perf_counter() - t0,
+                             summary=_result_summary(m, result))
         if save_root is not None:
             run.saved_paths = m.save_result(result, root=save_root,
                                             **(save_kwargs or {}))
+        if not keep_result:
+            run.result = None  # drop heavy arrays; summary/saved_paths remain
         return run
     except Exception as exc:  # noqa: BLE001 -- batch robustness, re-surfaced on the record
         return MeasurementRun(measurement=m, error=exc,
                               seconds=time.perf_counter() - t0)
+
+
+def _resolve_workers(max_workers: int | None) -> int:
+    """Resolve the worker count, failing safe when the allocation is unknown.
+
+    Order: an explicit ``max_workers`` always wins; else a reliable SLURM
+    allocation signal (``SLURM_CPUS_PER_TASK``, then ``SLURM_CPUS_ON_NODE``);
+    else raise. We deliberately do NOT fall back to ``os.cpu_count()`` /
+    ``sched_getaffinity`` -- on a shared login/compute node those report the
+    whole machine and would oversubscribe cores belonging to other users/jobs.
+    """
+    if max_workers is not None:
+        if max_workers < 1:
+            raise ValueError(f"max_workers must be >= 1, got {max_workers}")
+        return max_workers
+    for var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        val = os.environ.get(var)
+        if val and val.isdigit() and int(val) > 0:
+            return int(val)
+    raise RuntimeError(
+        "Cannot determine a safe worker count: no explicit max_workers and no "
+        "SLURM allocation (SLURM_CPUS_PER_TASK / SLURM_CPUS_ON_NODE) detected. "
+        "Pass max_workers=N explicitly (matched to your allocation) to avoid "
+        "oversubscribing a shared node."
+    )
+
+
+def _manifest_entry(run: "MeasurementRun") -> dict:
+    """Flat, JSON-serializable record of one measurement run."""
+    m = run.measurement
+    return {
+        "label": m.label(),
+        "kind": m.kind,
+        "sample": m.sample,
+        "emission_line": m.emission_line,
+        "incident_energy": m.incident_energy,
+        "series_index": m.series_index,
+        "n_data_files": len(m.data_paths),
+        "n_dark_files": len(m.dark_paths),
+        "ok": run.ok,
+        "saved_paths": list(run.saved_paths),
+        "seconds": round(run.seconds, 3),
+        "summary": run.summary,
+        "error": None if run.ok else f"{type(run.error).__name__}: {run.error}",
+    }
+
+
+def _write_manifest(path: str, runs: list["MeasurementRun"]) -> str:
+    """Write a JSON run manifest (per-measurement records + a small summary)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    n = len(runs)
+    n_ok = sum(r.ok for r in runs)
+    manifest = {
+        "n": n,
+        "n_ok": n_ok,
+        "n_failed": n - n_ok,
+        "total_seconds": round(sum(r.seconds for r in runs), 3),
+        "measurements": [_manifest_entry(r) for r in runs],
+    }
+    with open(path, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    return path
+
+
+def _print_run_line(run: "MeasurementRun", i: int, n: int, verbose: bool) -> None:
+    """Print one batch progress line for a completed run (no-op if not verbose)."""
+    if not verbose:
+        return
+    label = run.measurement.label()
+    if run.ok:
+        saved = f"  -> {len(run.saved_paths)} file(s)" if run.saved_paths else ""
+        print(f"  [{i}/{n}] {label:52s} {run.seconds:6.1f}s  ok{saved}")
+    else:
+        print(f"  [{i}/{n}] {label:52s} {run.seconds:6.1f}s  "
+              f"FAILED: {type(run.error).__name__}: {run.error}")
 
 
 @dataclass
@@ -371,6 +476,7 @@ class BeamtimeIndex:
 
     def run_all(self, *, save_root: str | None = None, save_kwargs: dict | None = None,
                 verbose: bool = True, detail: bool = False,
+                max_workers: int | None = None, manifest: bool = True,
                 **overrides) -> list[MeasurementRun]:
         """Run every measurement in the index and return a list of outcomes.
 
@@ -378,7 +484,9 @@ class BeamtimeIndex:
         ----------
         save_root:
             If given, each result is auto-named and written under
-            ``save_root/analysis/`` via :meth:`Measurement.save_result`.
+            ``save_root/analysis/`` via :meth:`Measurement.save_result`, and a
+            JSON run manifest is written to ``save_root/analysis/run_manifest.json``
+            (unless ``manifest=False``). Required when running in parallel.
         save_kwargs:
             Extra keywords forwarded to ``save_result`` (e.g. ``save_map=True``).
         verbose:
@@ -386,22 +494,60 @@ class BeamtimeIndex:
             closing summary (default ``True``).
         detail:
             Also stream each measurement's own progress (header + per-file lines)
-            by running it with ``verbose=True`` (default ``False``). Independent
-            of ``verbose``, which controls the batch summary lines.
+            by running it with ``verbose=True`` (default ``False``). Ignored in
+            parallel mode (child stdout would interleave across processes).
+        max_workers:
+            ``None`` / ``1`` -> run sequentially (default; full results kept on
+            each record). ``>1`` (or, when the caller passes ``max_workers`` but
+            wants the allocation resolved, see :func:`_resolve_workers`) -> run
+            measurements concurrently in a process pool. Parallel mode **requires**
+            ``save_root`` (results are saved in the worker and the heavy arrays are
+            dropped before returning, so nothing is lost); results come back in
+            completion order, not index order.
+        manifest:
+            Write the JSON run manifest when ``save_root`` is given (default True).
         **overrides:
             Pipeline overrides passed through to :meth:`Measurement.run`
             (e.g. ``threshold=[100, 170, 350]``, ``scan_nbrs=range(20)``,
-            ``central_pix=1280`` for RIXS).
+            ``central_pix=1280`` for RIXS). Must be picklable in parallel mode.
 
         Notes
         -----
-        Measurements run sequentially; a failure is captured on its
-        :class:`MeasurementRun` (``error``) instead of aborting the batch. Each
-        run is dispatched through :func:`run_measurement`, the single unit of
-        work intended for future parallel execution.
+        A failure is captured on its :class:`MeasurementRun` (``error``) instead
+        of aborting the batch. Each run is dispatched through
+        :func:`run_measurement`, the single unit of work.
         """
-        if detail:
-            overrides.setdefault("verbose", True)
+        n = len(self.measurements)
+        parallel = max_workers is not None and (max_workers != 1)
+        # A bare max_workers=1 is explicitly sequential; anything else parallel.
+        if parallel:
+            workers = _resolve_workers(max_workers)
+            if save_root is None:
+                raise ValueError(
+                    "Parallel run_all (max_workers>1) requires save_root: results "
+                    "are saved in the worker and their arrays dropped before "
+                    "returning, so they must be written to disk."
+                )
+            runs = self._run_parallel(workers, save_root, save_kwargs, verbose,
+                                      overrides)
+        else:
+            if detail:
+                overrides.setdefault("verbose", True)
+            runs = self._run_sequential(save_root, save_kwargs, verbose, overrides)
+
+        if verbose:
+            n_ok = sum(r.ok for r in runs)
+            total = sum(r.seconds for r in runs)
+            print(f"Done: {n_ok}/{n} succeeded in {total:.1f}s"
+                  + (f" ({n - n_ok} failed)" if n_ok < n else ""))
+        if save_root is not None and manifest:
+            path = _write_manifest(
+                os.path.join(save_root, "analysis", "run_manifest.json"), runs)
+            if verbose:
+                print(f"Wrote manifest: {path}")
+        return runs
+
+    def _run_sequential(self, save_root, save_kwargs, verbose, overrides):
         runs: list[MeasurementRun] = []
         n = len(self.measurements)
         if verbose:
@@ -410,19 +556,24 @@ class BeamtimeIndex:
             run = run_measurement(m, save_root=save_root, save_kwargs=save_kwargs,
                                   **overrides)
             runs.append(run)
-            if verbose:
-                if run.ok:
-                    saved = (f"  -> {len(run.saved_paths)} file(s)"
-                             if run.saved_paths else "")
-                    print(f"  [{i}/{n}] {m.label():52s} {run.seconds:6.1f}s  ok{saved}")
-                else:
-                    print(f"  [{i}/{n}] {m.label():52s} {run.seconds:6.1f}s  "
-                          f"FAILED: {type(run.error).__name__}: {run.error}")
+            _print_run_line(run, i, n, verbose)
+        return runs
+
+    def _run_parallel(self, workers, save_root, save_kwargs, verbose, overrides):
+        runs: list[MeasurementRun] = []
+        n = len(self.measurements)
+        overrides.pop("verbose", None)  # child stdout can't interleave cleanly
         if verbose:
-            n_ok = sum(r.ok for r in runs)
-            total = sum(r.seconds for r in runs)
-            print(f"Done: {n_ok}/{n} succeeded in {total:.1f}s"
-                  + (f" ({n - n_ok} failed)" if n_ok < n else ""))
+            print(f"Running {n} measurement(s) on {workers} worker(s)...")
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(run_measurement, m, save_root=save_root,
+                                   save_kwargs=save_kwargs, keep_result=False,
+                                   **overrides)
+                       for m in self.measurements]
+            for done, fut in enumerate(as_completed(futures), 1):
+                run = fut.result()
+                runs.append(run)
+                _print_run_line(run, done, n, verbose)
         return runs
 
 
@@ -571,3 +722,45 @@ def _group_xes(data: list[FileRecord], darks: list[FileRecord],
             data_paths=natsorted(r.path for r in recs), dark_paths=natsorted(dpaths),
         ))
     return out
+
+
+def run_beamtimes(directories, *, save_root: str, max_workers: int | None = None,
+                  index_kwargs: dict | None = None, verbose: bool = True,
+                  **overrides) -> dict[str, list[MeasurementRun]]:
+    """Index and run many beamtime directories, one output tree per beamtime.
+
+    Thin composable driver over :func:`index_beamtime` + :meth:`BeamtimeIndex.run_all`
+    for automated re-processing of multiple past beamtimes. Each directory is
+    indexed and run with its outputs written under
+    ``save_root/<directory_name>/analysis/`` (its own per-beamtime manifest
+    included); a combined ``save_root/run_manifest.json`` is written across all
+    beamtimes.
+
+    Parameters mirror :meth:`BeamtimeIndex.run_all` (``max_workers``,
+    ``**overrides`` such as ``threshold``); ``index_kwargs`` is forwarded to
+    :func:`index_beamtime` (e.g. ``{"skip_echem": False}``). ``save_root`` is
+    required. Returns ``{directory: [MeasurementRun, ...]}``.
+
+    This is deliberately just a loop over the public pieces -- for full control
+    (or a SLURM job array with one directory per task) call ``index_beamtime`` +
+    ``run_all`` yourself.
+    """
+    index_kwargs = index_kwargs or {}
+    all_runs: dict[str, list[MeasurementRun]] = {}
+    flat: list[MeasurementRun] = []
+    for directory in directories:
+        name = os.path.basename(os.path.normpath(directory))
+        if verbose:
+            print(f"=== beamtime: {name} ===")
+        idx = index_beamtime(directory, **index_kwargs)
+        runs = idx.run_all(save_root=os.path.join(save_root, name),
+                           max_workers=max_workers, verbose=verbose, **overrides)
+        all_runs[directory] = runs
+        flat.extend(runs)
+
+    path = _write_manifest(os.path.join(save_root, "run_manifest.json"), flat)
+    if verbose:
+        n_ok = sum(r.ok for r in flat)
+        print(f"All beamtimes: {n_ok}/{len(flat)} measurements ok. "
+              f"Combined manifest: {path}")
+    return all_runs

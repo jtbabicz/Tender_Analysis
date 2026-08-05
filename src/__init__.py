@@ -18,7 +18,7 @@ from .analyze import extract_signal, XESResult
 from .pipeline import OnePot, OnePotRIXS, Thresholds, RIXSResult
 from .dataset import (
     index_beamtime, Measurement, FileRecord, BeamtimeIndex, parse_sif_name,
-    MeasurementRun, run_measurement,
+    MeasurementRun, run_measurement, run_beamtimes,
 )
 
 __all__ = [
@@ -39,4 +39,5 @@ __all__ = [
     "parse_sif_name",
     "MeasurementRun",
     "run_measurement",
+    "run_beamtimes",
 ]
