@@ -370,7 +370,8 @@ class BeamtimeIndex:
         return [m for m in self.measurements if m.kind == kind]
 
     def run_all(self, *, save_root: str | None = None, save_kwargs: dict | None = None,
-                verbose: bool = True, **overrides) -> list[MeasurementRun]:
+                verbose: bool = True, detail: bool = False,
+                **overrides) -> list[MeasurementRun]:
         """Run every measurement in the index and return a list of outcomes.
 
         Parameters
@@ -383,6 +384,10 @@ class BeamtimeIndex:
         verbose:
             Print a per-measurement progress line (name, time, status) and a
             closing summary (default ``True``).
+        detail:
+            Also stream each measurement's own progress (header + per-file lines)
+            by running it with ``verbose=True`` (default ``False``). Independent
+            of ``verbose``, which controls the batch summary lines.
         **overrides:
             Pipeline overrides passed through to :meth:`Measurement.run`
             (e.g. ``threshold=[100, 170, 350]``, ``scan_nbrs=range(20)``,
@@ -395,6 +400,8 @@ class BeamtimeIndex:
         run is dispatched through :func:`run_measurement`, the single unit of
         work intended for future parallel execution.
         """
+        if detail:
+            overrides.setdefault("verbose", True)
         runs: list[MeasurementRun] = []
         n = len(self.measurements)
         if verbose:

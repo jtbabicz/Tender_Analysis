@@ -117,6 +117,9 @@ class OnePot:
         Per-frame common-mode scaling of the background.
     file_nbrs / scan_nbrs:
         Optional 0-based file / frame subset selectors (``None`` = all).
+    verbose:
+        Print progress: a header (files/frames/background) and a per-file line
+        during extraction (default ``False``).
     """
 
     def __init__(
@@ -130,6 +133,7 @@ class OnePot:
         file_nbrs=None,
         scan_nbrs=None,
         histograms: bool = False,
+        verbose: bool = False,
     ):
         self.files = files
         self.thresholds = Thresholds.from_input(threshold)
@@ -140,6 +144,7 @@ class OnePot:
         self.file_nbrs = file_nbrs
         self.scan_nbrs = scan_nbrs
         self.histograms = histograms
+        self.verbose = verbose
 
         self._paths: list[str] | None = None
         self._sif: list[SifFile] | None = None
@@ -179,6 +184,7 @@ class OnePot:
             bcg_adjust=self.bcg_adjust,
             curvature=curvature,
             histograms=histograms,
+            verbose=self.verbose,
         )
 
     def correct(self, image, t=None) -> tuple[np.ndarray, np.ndarray]:
@@ -192,7 +198,14 @@ class OnePot:
     def run(self) -> XESResult:
         """Execute the full pipeline and return an :class:`XESResult`."""
         self.find_files()
+        if self.verbose:
+            n_frames = sum(s.num_frames for s in self.sif_files)
+            print(f"{type(self).__name__}: {len(self.sif_files)} file(s), "
+                  f"{n_frames} frame(s), background: {self._bcg_description()}")
         bcg = self.compute_background()
+        if self.verbose:
+            print(f"  extracting signal from {sum(s.num_frames for s in self.sif_files)} "
+                  f"frame(s)...")
         th = self.thresholds
 
         if self.evolution:
@@ -290,11 +303,12 @@ class OnePotRIXS(OnePot):
 
     def __init__(self, files, threshold=None, bcg=None, bcg_adjust=True,
                  file_nbrs=None, scan_nbrs=None, exclude_dark=True, dark_suffix="_dark",
-                 use_dark_as_background=False, evolution=False, histograms=False):
+                 use_dark_as_background=False, evolution=False, histograms=False,
+                 verbose=False):
         super().__init__(files, threshold=threshold, bcg=bcg, evolution=evolution,
                          scan=True, bcg_adjust=bcg_adjust,
                          file_nbrs=file_nbrs, scan_nbrs=scan_nbrs,
-                         histograms=histograms)
+                         histograms=histograms, verbose=verbose)
         self.exclude_dark = exclude_dark
         self.dark_suffix = dark_suffix
         self.use_dark_as_background = use_dark_as_background

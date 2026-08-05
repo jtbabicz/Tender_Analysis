@@ -203,7 +203,10 @@ def extract_signal(
     counter = -1  # 0-based global frame index
     for file_idx, sif in enumerate(files):
         if verbose:
-            print(f"({file_idx + 1}/{len(files)}) Analyzing: {sif.path}")
+            start = counter + 1
+            end = start + sif.num_frames - 1
+            print(f"    ({file_idx + 1}/{len(files)}) {os.path.basename(sif.path)} "
+                  f"— frames {start}–{end}")
         for i in range(sif.num_frames):
             counter += 1
             i_scan = counter  # 0-based column into total_counts
