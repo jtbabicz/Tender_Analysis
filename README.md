@@ -90,6 +90,44 @@ locates the emission-line centre by a gaussian fit. `verbose=True` prints a
 progress header and a per-file line during extraction (most of a measurement's
 time is spent there).
 
+### ADU thresholds
+
+The `threshold` argument (to `OnePot`, `OnePotRIXS`, and every batch call) controls
+the single-photon event extraction — it separates real X-ray events from readout
+noise and cosmic rays, in detector ADU (counts). Internally it is always the
+canonical **four** values `[bcg_cutoff, low, xray, hi]` (the `Thresholds`
+dataclass), each with a distinct job:
+
+| Value        | Role                                                              |
+|--------------|-------------------------------------------------------------------|
+| `bcg_cutoff` | Loose cutoff used only by the `evolution=True` curvature pre-pass; unused in the normal single-pass path. |
+| `low`        | 3×3 neighbourhood gate — is there a photon event at this pixel?    |
+| `xray`       | Minimum per-event (connected-component) intensity to keep the event. |
+| `hi`         | Upper ceiling — pixels above this are rejected as cosmics / high-energy hits. |
+
+You can supply fewer values and the rest are filled in (mirroring the MATLAB
+`onepot.m` defaulting). Given input `v`:
+
+| Input                | Expands to `[bcg_cutoff, low, xray, hi]`      |
+|----------------------|------------------------------------------------|
+| `None` (default)     | `[60, 100, 170, 2000]`                         |
+| `[x]` (scalar)       | `[0.8·x, x, 1.1·x, 65536]`                     |
+| `[a, b]`             | `[0.8·b, b, 1.1·b, b]`                          |
+| `[a, b, c]`          | `[a, b, 1.1·b, c]`  — i.e. `bcg_cutoff, low, hi`; `xray` is derived |
+| `[a, b, c, d]`       | `[a, b, c, d]` (used as-is)                     |
+
+The common three-element form (e.g. `threshold=[100, 170, 350]`, used throughout
+the notebook) is therefore `bcg_cutoff=100`, `low=170`, `hi=350`, with `xray`
+auto-filled to `187`. **Watch the two different 3-element groupings:** what you
+*supply* is `[bcg_cutoff, low, hi]`, but what the extractor actually consumes is
+the 3-element `[low, xray, hi]` (the `bcg_cutoff` is only for the evolution
+pre-pass). Exports always record the full four-element array in their header for
+provenance.
+
+To choose thresholds for a new detector/sample, run with `histograms=True` and
+inspect the ADU histograms (see the notebook's *Diagnostic histograms* section):
+`low`/`xray` sit above the noise floor, `hi` below the cosmic tail.
+
 ### Batch: a whole sample directory
 
 `index_beamtime` parses the `.sif` filenames in a directory (typically one
