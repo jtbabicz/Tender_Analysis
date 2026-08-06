@@ -203,6 +203,13 @@ scattering at several fixed monochromator energies: each elastic peak lands on a
 particular pixel, so fitting the peak centres and linear-fitting
 `(centre_pixel → mono_energy)` gives the `energy = m·pixel + b` conversion.
 
+Each elastic spectrum is extracted with the same `OnePot` single-photon
+pipeline used for XES (a raw frame sum would be swamped by the readout
+baseline), using the `_dark.sif` taken at the same energy as the background. A
+matching dark at each energy is **required** — pairing elastic and dark per
+energy is the calibration protocol (best S/N and accuracy), so a missing dark
+raises `ValueError` rather than calibrating without a background.
+
 This is a **standalone, skippable** step — elastic data is often unavailable
 until post-beamtime analysis, so it is never built or required by the standard
 workflow. Elastic `.sif` files (`*elastic*.sif`) are skipped by

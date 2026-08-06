@@ -73,7 +73,12 @@ def index_elastic(directory: str, *, recursive: bool = False, threshold=None,
     Each spectrum is produced by the :class:`~onepot.pipeline.OnePot`
     single-photon extraction (not a raw frame sum -- the raw readout baseline
     swamps the sparse elastic line), with the paired ``*_dark.sif`` at the same
-    energy wired in as the background when present.
+    mono energy wired in as the background.
+
+    A matching dark is **required** for every elastic scan: pairing an elastic
+    scan with the dark taken at the same energy is the calibration protocol and
+    gives the best S/N and energy accuracy. An elastic scan with no dark at its
+    energy raises :class:`ValueError` rather than running without a background.
 
     Parameters
     ----------
@@ -85,6 +90,11 @@ def index_elastic(directory: str, *, recursive: bool = False, threshold=None,
         Forwarded to :class:`~onepot.pipeline.OnePot` for per-file progress.
 
     A single glob pattern is also accepted in place of a directory.
+
+    Raises
+    ------
+    ValueError
+        If an elastic scan has no ``*_dark.sif`` at the same mono energy.
     """
     if glob.has_magic(directory):
         paths = glob.glob(directory, recursive=recursive)
@@ -113,8 +123,16 @@ def index_elastic(directory: str, *, recursive: bool = False, threshold=None,
         if energy is None or np.isnan(energy):
             continue
         # Single-photon extraction with the paired dark (same energy) as bcg.
+        # A matching dark is mandatory -- refuse to calibrate without it.
         dark_path = darks.get(round(float(energy), 2))
-        bcg = SifFile(dark_path).data.mean(axis=0) if dark_path is not None else None
+        if dark_path is None:
+            raise ValueError(
+                f"No *_dark.sif at {energy:g} eV to pair with elastic scan "
+                f"{os.path.basename(path)!r}. Elastic calibration requires a dark "
+                f"at each energy (best S/N and accuracy); add the missing dark or "
+                f"drop that energy from the calibration set."
+            )
+        bcg = SifFile(dark_path).data.mean(axis=0)
         spectrum = OnePot(path, bcg=bcg, threshold=threshold,
                           verbose=verbose).run().spectrum()
         points.append(ElasticPoint(energy=float(energy),
