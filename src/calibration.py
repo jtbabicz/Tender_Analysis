@@ -32,7 +32,7 @@ from natsort import natsorted
 from scipy.optimize import curve_fit
 
 from .dataset import parse_sif_name
-from .pipeline import _energy_from_name
+from .pipeline import OnePot, _energy_from_name
 from .sif_io import SifFile
 
 
@@ -60,14 +60,29 @@ class ElasticPoint:
     path: str
 
 
-def index_elastic(directory: str, *, recursive: bool = False) -> list[ElasticPoint]:
+def index_elastic(directory: str, *, recursive: bool = False, threshold=None,
+                  verbose: bool = False) -> list[ElasticPoint]:
     """Find elastic-scattering ``.sif`` files in ``directory`` and load them.
 
     Globs ``.sif`` files (recursively if ``recursive``), keeps only those whose
     parsed name is flagged :attr:`~onepot.dataset.FileRecord.is_elastic`, and
-    returns one :class:`ElasticPoint` per file (naturally sorted). The energy is
-    taken from the SIF ``mono`` comment, falling back to a ``dddd.dd`` token in
-    the filename. Files whose energy cannot be resolved are skipped.
+    returns one :class:`ElasticPoint` per elastic energy (naturally sorted). The
+    energy is taken from the SIF ``mono`` comment, falling back to a ``dddd.dd``
+    token in the filename; files whose energy cannot be resolved are skipped.
+
+    Each spectrum is produced by the :class:`~onepot.pipeline.OnePot`
+    single-photon extraction (not a raw frame sum -- the raw readout baseline
+    swamps the sparse elastic line), with the paired ``*_dark.sif`` at the same
+    energy wired in as the background when present.
+
+    Parameters
+    ----------
+    threshold:
+        ADU thresholds forwarded to :class:`~onepot.pipeline.OnePot` (see
+        :meth:`~onepot.pipeline.Thresholds.from_input`). ``None`` uses the OnePot
+        default.
+    verbose:
+        Forwarded to :class:`~onepot.pipeline.OnePot` for per-file progress.
 
     A single glob pattern is also accepted in place of a directory.
     """
@@ -78,19 +93,32 @@ def index_elastic(directory: str, *, recursive: bool = False) -> list[ElasticPoi
     else:
         paths = glob.glob(os.path.join(directory, "*.sif"))
 
+    # Separate elastic signal files from their paired darks (both carry
+    # "elastic" in the name, so is_elastic alone would wrongly include darks).
+    recs = [(p, parse_sif_name(p)) for p in natsorted(paths)]
+    recs = [(p, r) for p, r in recs if r is not None and r.is_elastic]
+    darks = {}
+    for p, r in recs:
+        if r.is_dark and r.energy is not None:
+            darks[round(r.energy, 2)] = p
+
     points: list[ElasticPoint] = []
-    for path in natsorted(paths):
-        rec = parse_sif_name(path)
-        if rec is None or not rec.is_elastic:
+    for path, rec in recs:
+        if rec.is_dark:
             continue
-        sif = SifFile(path)
-        energy = sif.mono
+        # Prefer the SIF mono comment; fall back to the parsed / filename energy.
+        energy = SifFile(path).mono
         if energy is None or np.isnan(energy):
-            energy = _energy_from_name(path)
+            energy = rec.energy if rec.energy is not None else _energy_from_name(path)
         if energy is None or np.isnan(energy):
             continue
+        # Single-photon extraction with the paired dark (same energy) as bcg.
+        dark_path = darks.get(round(float(energy), 2))
+        bcg = SifFile(dark_path).data.mean(axis=0) if dark_path is not None else None
+        spectrum = OnePot(path, bcg=bcg, threshold=threshold,
+                          verbose=verbose).run().spectrum()
         points.append(ElasticPoint(energy=float(energy),
-                                    spectrum=sif.spectrum(), path=path))
+                                    spectrum=spectrum, path=path))
     return points
 
 
@@ -222,14 +250,18 @@ def _fit_center(spectrum: np.ndarray, fit_window: int | None = None) -> float:
 
 
 def calibrate_from_directory(directory: str, *, recursive: bool = False,
-                             fit_window: int | None = None) -> ElasticCalibration:
+                             threshold=None, fit_window: int | None = None,
+                             verbose: bool = False) -> ElasticCalibration:
     """Convenience: :func:`index_elastic` + :meth:`ElasticCalibration.fit`.
 
     Finds the elastic ``.sif`` files under ``directory`` and returns a fitted
-    :class:`ElasticCalibration`. Raises :class:`ValueError` if fewer than two
-    elastic points are found.
+    :class:`ElasticCalibration`. ``threshold`` / ``verbose`` are forwarded to the
+    per-file :class:`~onepot.pipeline.OnePot` extraction; ``fit_window`` to the
+    Lorentzian fit. Raises :class:`ValueError` if fewer than two elastic points
+    are found.
     """
-    points = index_elastic(directory, recursive=recursive)
+    points = index_elastic(directory, recursive=recursive, threshold=threshold,
+                           verbose=verbose)
     if len(points) < 2:
         raise ValueError(
             f"Found {len(points)} elastic scan(s) in {directory!r}; need >= 2 "
