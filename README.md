@@ -128,9 +128,10 @@ Each threshold gates a *specific* distribution: `low` gates the `3×3 binned`
 per-pixel frame, `hi` is the cosmic cut on the `raw − background` per-pixel
 frame, and `xray` is the minimum per-event (grain) intensity. To choose values
 for a new detector/sample, run with `histograms=True` and inspect the ADU
-histograms (see the notebook's *Diagnostic histograms* section, which marks each
-threshold on the panel it acts on): set `low` just above the per-pixel noise
-floor, `hi` below the cosmic tail, and `xray` above the per-event noise bump.
+histograms (see the notebook's *Diagnostic histograms* section, which plots each
+distribution in its own box with the threshold line colour-matched to the trace
+it filters): set `low` just above the per-pixel noise floor, `hi` below the
+cosmic tail, and `xray` above the per-event noise bump.
 
 ### Batch: a whole sample directory
 
