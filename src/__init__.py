@@ -20,6 +20,9 @@ from .dataset import (
     index_beamtime, Measurement, FileRecord, BeamtimeIndex, parse_sif_name,
     MeasurementRun, run_measurement, run_beamtimes,
 )
+from .calibration import (
+    ElasticCalibration, ElasticPoint, index_elastic, calibrate_from_directory,
+)
 
 __all__ = [
     "OnePot",
@@ -40,4 +43,8 @@ __all__ = [
     "MeasurementRun",
     "run_measurement",
     "run_beamtimes",
+    "ElasticCalibration",
+    "ElasticPoint",
+    "index_elastic",
+    "calibrate_from_directory",
 ]

@@ -7,9 +7,13 @@ Orginally written by Tsu-Chien Weng and Stanislaw Nowak.<sup>1,2</sup>
 
 The example notebook `Tender_Analysis_Example.ipynb` walks through reading a SIF
 file, the `OnePot` XES pipeline, ADU-threshold diagnostics, the `OnePotRIXS`
-HERFD/XAS workflow, and batch-processing a whole beamtime directory with
-`index_beamtime` (including parallel execution and a JSON run manifest). Two
-sample datasets are bundled under `data/`:
+HERFD/XAS workflow, and batch-processing a whole sample directory with
+`index_beamtime` (including parallel execution and a JSON run manifest). A
+directory such as `data/CPMoITriCO3Dimer/` holds all the measurements for a
+*single compound* collected within a beamtime — many compounds are measured per
+beamtime, each in its own directory. (The batch functions keep the historical
+`beamtime` name for backward compatibility, but they operate on one such
+sample directory.) Two sample datasets are bundled under `data/`:
 
 - `data/Na2SO4/` — sulfur K RIXS energy scan (Na<sub>2</sub>SO<sub>4</sub> pellet).
 - `data/CPMoITriCO3Dimer/` — Mo L<sub>3</sub> valence-to-core XES of the
@@ -28,7 +32,8 @@ The package lives in `src/`. Modules port the MATLAB routines one-to-one:
 | `analyze.py`    | `sifAnalyze.m`          | `extract_signal()`: single-photon event extraction   |
 | `curvature.py`  | `sifAutoCorrelation.m`  | `CurvatureCorrection`: banana-shape fit + apply      |
 | `pipeline.py`   | `onepot.m`, `onepotRIXS.m`| `OnePot` / `OnePotRIXS` orchestrators              |
-| `dataset.py`    | (new)                   | `index_beamtime()` / `run_beamtimes()`: group a directory into runnable `Measurement`s, batch-run them (optionally parallel), and write a JSON manifest |
+| `dataset.py`    | (new)                   | `index_beamtime()` / `run_beamtimes()`: group a sample directory into runnable `Measurement`s, batch-run them (optionally parallel, with per-measurement parameters), and write a JSON manifest |
+| `calibration.py`| (new)                   | `ElasticCalibration` / `calibrate_from_directory()`: fit a pixel→energy calibration from elastic scans (post-beamtime, optional) |
 
 ## Orientation convention
 
@@ -85,13 +90,14 @@ locates the emission-line centre by a gaussian fit. `verbose=True` prints a
 progress header and a per-file line during extraction (most of a measurement's
 time is spent there).
 
-### Batch: a whole beamtime directory
+### Batch: a whole sample directory
 
-`index_beamtime` parses the `.sif` filenames in a directory and groups them into
+`index_beamtime` parses the `.sif` filenames in a directory (typically one
+compound's measurements collected within a beamtime) and groups them into
 `Measurement` objects — one XES measurement per incident energy, one RIXS
 measurement per energy series — auto-pairing `*_dark.sif` files as the
-background. Calibration/alignment and operando-echem files are skipped by
-default and reported in `.skipped` (never silently dropped).
+background. Calibration/alignment (including elastic scans) and operando-echem
+files are skipped by default and reported in `.skipped` (never silently dropped).
 
 ```python
 idx = index_beamtime("data/CPMoITriCO3Dimer")   # -> BeamtimeIndex
@@ -117,6 +123,35 @@ writes a JSON run manifest to `save_root/analysis/run_manifest.json` (one entry
 per measurement: label, ok/failed, output paths, timing, error) so unattended
 batch runs are auditable.
 
+#### Per-measurement parameters
+
+The `**overrides` above are a single baseline applied to *every* measurement.
+When measurements in the same directory need different parameters — e.g. a
+concentrated and a dilute version of a sample need different ADU thresholds —
+pass `param_fn`, a resolver `param_fn(measurement) -> dict` whose returned dict
+is overlaid **on top of** the global overrides for that one measurement only:
+
+```python
+def per_measurement(m):
+    # m carries .sample, .emission_line, .incident_energy, .kind, .label()
+    if "dilute" in m.sample:
+        return {"threshold": [60, 110, 250]}   # override just this one
+    return {}                                  # keep the global baseline
+
+runs = idx.run_all(save_root="out/CPMoITriCO3Dimer",
+                   threshold=[100, 170, 350],   # baseline for everything
+                   param_fn=per_measurement)
+```
+
+Returning `{}` / `None` keeps the global values, so with `param_fn=None`
+(default) behavior is identical to passing globals alone. `run_beamtimes` takes
+the same `param_fn` — since the resolver keys off the `Measurement`, one function
+can span every directory. The resolver runs in the parent process, so it need
+not be picklable even in parallel mode (only the resulting overrides dict does,
+as before). If reorganizing the files into separate directories is simpler than
+writing a resolver, that remains a valid alternative — `param_fn` is here for
+when it is not.
+
 ### Parallel batch execution (HPC / many beamtimes)
 
 For large re-processing jobs, `run_all(max_workers=N)` runs measurements
@@ -130,7 +165,7 @@ arrays back between processes.
 runs = idx.run_all(save_root="out/CPMoITriCO3Dimer",
                    max_workers=8, threshold=[100, 170, 350])
 
-# Many beamtime directories in one call -> per-beamtime outputs + combined manifest.
+# Many sample directories in one call -> per-directory outputs + combined manifest.
 run_beamtimes(["beamtimes/2025-06/SampleA", "beamtimes/2025-06/SampleB"],
               save_root="out", max_workers=8, threshold=[100, 170, 350])
 ```
@@ -160,6 +195,37 @@ rixs_out.save_txt("na2so4.txt", save_map=True)     # RIXS: energy, HERFD, TFY (+
 For batch runs, `Measurement.save_result(result, root=...)` auto-names the file
 from the measurement metadata into an `analysis/` subdirectory (this is what
 `run_all(save_root=...)` calls).
+
+### Energy calibration (pixel → energy)
+
+The energy-dispersive (pixel) axis is calibrated by collecting elastic
+scattering at several fixed monochromator energies: each elastic peak lands on a
+particular pixel, so fitting the peak centres and linear-fitting
+`(centre_pixel → mono_energy)` gives the `energy = m·pixel + b` conversion.
+
+This is a **standalone, skippable** step — elastic data is often unavailable
+until post-beamtime analysis, so it is never built or required by the standard
+workflow. Elastic `.sif` files (`*elastic*.sif`) are skipped by
+`index_beamtime` as before; the calibration API opts back in explicitly:
+
+```python
+from src import calibrate_from_directory, ElasticCalibration
+
+# Fit from a directory of elastic scans, then persist for reuse.
+cal = calibrate_from_directory("data/elastic_2024-06")   # -> ElasticCalibration
+cal.m, cal.b, cal.rms                                    # coeffs + RMS residual (eV)
+cal.save_json("calib.json")
+cal = ElasticCalibration.load_json("calib.json")         # reload later
+
+# Apply it at export time: XES spectra gain an `energy_eV` column
+# (pixel, energy_eV, counts). Without a calibration, output is unchanged.
+result.save_txt("mo_2523.txt", calibration=cal)
+runs = idx.run_all(save_root="out", threshold=[100, 170, 350],
+                   save_kwargs={"calibration": cal})      # applied to XES results
+```
+
+`save_kwargs={"calibration": cal}` is dropped for RIXS results (whose export
+already carries an incident-energy axis), so a mixed-kind batch is safe.
 
 ## Dependencies
 
