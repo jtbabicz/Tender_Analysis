@@ -110,18 +110,32 @@ class XESResult:
             img = img.sum(axis=0)
         return img.sum(axis=0)
 
-    def save_txt(self, path: str) -> str:
+    def save_txt(self, path: str, calibration=None) -> str:
         """Write the emission spectrum to ``path`` as commented-header text.
 
-        Two columns: ``pixel`` and ``counts``. The header records provenance from
-        :attr:`meta` (source files, thresholds, background mode, ...). Returns the
-        path written.
+        Columns are ``pixel counts`` by default. When an ``ElasticCalibration``
+        (see :mod:`onepot.calibration`) is passed, an ``energy_eV`` column
+        (``calibration.to_energy(pixel)``) is inserted between them, giving
+        ``pixel energy_eV counts``, and the calibration coefficients are recorded
+        in the header. The header always records provenance from :attr:`meta`
+        (source files, thresholds, background mode, ...). Returns the path written.
         """
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         spec = self.spectrum()
-        cols = np.column_stack([np.arange(spec.size), spec])
-        header = format_meta_header(self.meta, extra={"columns": "pixel counts"})
-        np.savetxt(path, cols, header=header, fmt=["%d", "%.8g"])
+        pixels = np.arange(spec.size)
+        if calibration is not None:
+            energy = calibration.to_energy(pixels)
+            cols = np.column_stack([pixels, energy, spec])
+            header = format_meta_header(
+                self.meta,
+                extra={"energy_calibration": repr(calibration),
+                       "columns": "pixel energy_eV counts"})
+            fmt = ["%d", "%.6f", "%.8g"]
+        else:
+            cols = np.column_stack([pixels, spec])
+            header = format_meta_header(self.meta, extra={"columns": "pixel counts"})
+            fmt = ["%d", "%.8g"]
+        np.savetxt(path, cols, header=header, fmt=fmt)
         return path
 
 

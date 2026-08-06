@@ -1,7 +1,11 @@
-"""Beamtime directory indexing and measurement grouping.
+"""Sample-directory indexing and measurement grouping.
 
-A finalized beamtime directory holds many *measurements* mixed together: XES
-emission scans (fixed incident energy, one or more scan indices, each with a
+A directory here (e.g. ``CPMoITriCO3Dimer/``) typically holds all measurements
+for a *single compound* collected within a beamtime -- many compounds are
+measured per beamtime, each in its own directory. (The public functions retain
+the ``beamtime`` name for backward compatibility, but they operate on one
+sample's directory.) Such a directory holds many *measurements* mixed together:
+XES emission scans (fixed incident energy, one or more scan indices, each with a
 paired dark) and RIXS scans (a full incident-energy series with one dark). The
 :class:`OnePot` / :class:`OnePotRIXS` pipelines each analyze a single
 measurement, so this module supplies the missing layer: parse the ``.sif``
@@ -49,6 +53,12 @@ LINE_RE = re.compile(
 AUX_KEYWORDS = ["elastic", "alignment", "align", "background", "bkg",
                 "test", "pgm", "calib", "reference_grid", "focus", "belowedge"]
 
+# Elastic-scattering scans (pixel->energy calibration). These are a *subset* of
+# the aux files above (``elastic`` is an AUX_KEYWORD), so index_beamtime still
+# skips them from the standard workflow; the calibration module (see
+# ``calibration.py``) opts back in by filtering on ``FileRecord.is_elastic``.
+_ELASTIC_RE = re.compile(r"elastic", re.IGNORECASE)
+
 # Commissioning / spectrometer-alignment patterns (case-insensitive regex).
 AUX_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in (
@@ -94,6 +104,7 @@ class FileRecord:
     is_dark: bool
     is_aux: bool
     is_echem: bool
+    is_elastic: bool = False          # elastic-scattering calibration scan
     kind: str | None = None           # "XES"/"RIXS", set by _assign_kinds
 
 
@@ -116,6 +127,7 @@ def parse_sif_name(path: str) -> FileRecord | None:
     is_aux = (any(k in low_core for k in AUX_KEYWORDS)
               or any(p.search(core) for p in AUX_PATTERNS))
     is_echem = any(p.search(core) for p in ECHEM_PATTERNS)
+    is_elastic = bool(_ELASTIC_RE.search(core))
 
     # explicit technique token, if present
     if "rixs" in low_core or "rxes" in low_core:
@@ -190,7 +202,7 @@ def parse_sif_name(path: str) -> FileRecord | None:
         path=path, sample=label, emission_line=emission_line,
         technique_token=technique_token, energy=energy, scan_index=scan_index,
         series_index=series_index, is_dark=is_dark, is_aux=is_aux,
-        is_echem=is_echem,
+        is_echem=is_echem, is_elastic=is_elastic,
     )
 
 
@@ -296,10 +308,14 @@ class Measurement:
         """
         out_dir = os.path.join(root, subdir) if subdir else root
         path = os.path.join(out_dir, self.label() + ".txt")
-        # ``save_map`` is a RIXS-only knob; drop it for XES so a batch call like
-        # ``run_all(save_kwargs={"save_map": True})`` over a mixed beamtime
-        # doesn't raise on the XES results (whose save_txt takes only ``path``).
-        if self.kind != "RIXS":
+        # Each result's ``save_txt`` accepts a different set of knobs; drop the
+        # ones the target doesn't understand so a single batch call with mixed
+        # measurement kinds doesn't raise. ``save_map`` is RIXS-only;
+        # ``calibration`` (pixel->emission-energy axis) is XES-only.
+        if self.kind == "RIXS":
+            save_kwargs = {k: v for k, v in save_kwargs.items()
+                           if k != "calibration"}
+        else:
             save_kwargs = {k: v for k, v in save_kwargs.items() if k != "save_map"}
         return _as_list(result.save_txt(path, **save_kwargs))
 
@@ -383,6 +399,31 @@ def run_measurement(m: Measurement, *, save_root: str | None = None,
                               seconds=time.perf_counter() - t0)
 
 
+def _merge_overrides(m: Measurement, param_fn, overrides: dict) -> dict:
+    """Overlay a per-measurement resolver on top of the global overrides.
+
+    ``param_fn`` (if given) is called with the :class:`Measurement` and returns a
+    dict of pipeline overrides that take precedence over the shared ``overrides``
+    for *this* measurement only. Returning ``None`` / ``{}`` means "use the
+    globals unchanged". With ``param_fn=None`` the global ``overrides`` are passed
+    through verbatim, so a single global ``threshold=[...]`` still applies to
+    every measurement (backward compatible).
+
+    Resolution happens in the *parent* process, so ``param_fn`` itself never
+    crosses the process boundary in parallel mode -- each worker still receives a
+    plain, picklable dict (the merged dict must be picklable, same as today).
+    """
+    if param_fn is None:
+        return overrides
+    extra = param_fn(m) or {}
+    if not isinstance(extra, dict):
+        raise TypeError(
+            f"param_fn must return a dict (or None); got {type(extra).__name__} "
+            f"for measurement {m.label()!r}"
+        )
+    return {**overrides, **extra}
+
+
 def _resolve_workers(max_workers: int | None) -> int:
     """Resolve the worker count, failing safe when the allocation is unknown.
 
@@ -460,7 +501,12 @@ def _print_run_line(run: "MeasurementRun", i: int, n: int, verbose: bool) -> Non
 
 @dataclass
 class BeamtimeIndex:
-    """Result of :func:`index_beamtime`: measurements plus a skipped-file bucket."""
+    """Result of :func:`index_beamtime`: measurements plus a skipped-file bucket.
+
+    Indexes one sample directory (typically a single compound's measurements
+    collected within a beamtime; the ``Beamtime`` name is kept for backward
+    compatibility).
+    """
 
     measurements: list[Measurement]
     skipped: dict[str, list[str]] = field(default_factory=dict)  # reason -> paths
@@ -477,7 +523,7 @@ class BeamtimeIndex:
     def run_all(self, *, save_root: str | None = None, save_kwargs: dict | None = None,
                 verbose: bool = True, detail: bool = False,
                 max_workers: int | None = None, manifest: bool = True,
-                **overrides) -> list[MeasurementRun]:
+                param_fn=None, **overrides) -> list[MeasurementRun]:
         """Run every measurement in the index and return a list of outcomes.
 
         Parameters
@@ -488,7 +534,8 @@ class BeamtimeIndex:
             JSON run manifest is written to ``save_root/analysis/run_manifest.json``
             (unless ``manifest=False``). Required when running in parallel.
         save_kwargs:
-            Extra keywords forwarded to ``save_result`` (e.g. ``save_map=True``).
+            Extra keywords forwarded to ``save_result`` (e.g. ``save_map=True``,
+            or ``calibration=<ElasticCalibration>`` to write an energy axis).
         verbose:
             Print a per-measurement progress line (name, time, status) and a
             closing summary (default ``True``).
@@ -506,6 +553,15 @@ class BeamtimeIndex:
             completion order, not index order.
         manifest:
             Write the JSON run manifest when ``save_root`` is given (default True).
+        param_fn:
+            Optional resolver ``param_fn(measurement) -> dict | None``. The global
+            ``**overrides`` are the baseline applied to *every* measurement; the
+            dict returned here overlays per-measurement adjustments on top for that
+            one measurement (e.g. a different ``threshold`` for a concentrated vs.
+            a dilute sample). Returning ``None`` / ``{}`` keeps the globals. With
+            ``param_fn=None`` (default) behavior is identical to passing globals
+            alone. The callable runs in the parent process, so it need not be
+            picklable even in parallel mode (see :func:`_merge_overrides`).
         **overrides:
             Pipeline overrides passed through to :meth:`Measurement.run`
             (e.g. ``threshold=[100, 170, 350]``, ``scan_nbrs=range(20)``,
@@ -529,11 +585,12 @@ class BeamtimeIndex:
                     "returning, so they must be written to disk."
                 )
             runs = self._run_parallel(workers, save_root, save_kwargs, verbose,
-                                      overrides)
+                                      param_fn, overrides)
         else:
             if detail:
                 overrides.setdefault("verbose", True)
-            runs = self._run_sequential(save_root, save_kwargs, verbose, overrides)
+            runs = self._run_sequential(save_root, save_kwargs, verbose,
+                                        param_fn, overrides)
 
         if verbose:
             n_ok = sum(r.ok for r in runs)
@@ -547,28 +604,31 @@ class BeamtimeIndex:
                 print(f"Wrote manifest: {path}")
         return runs
 
-    def _run_sequential(self, save_root, save_kwargs, verbose, overrides):
+    def _run_sequential(self, save_root, save_kwargs, verbose, param_fn, overrides):
         runs: list[MeasurementRun] = []
         n = len(self.measurements)
         if verbose:
             print(f"Running {n} measurement(s)...")
         for i, m in enumerate(self.measurements, 1):
+            merged = _merge_overrides(m, param_fn, overrides)
             run = run_measurement(m, save_root=save_root, save_kwargs=save_kwargs,
-                                  **overrides)
+                                  **merged)
             runs.append(run)
             _print_run_line(run, i, n, verbose)
         return runs
 
-    def _run_parallel(self, workers, save_root, save_kwargs, verbose, overrides):
+    def _run_parallel(self, workers, save_root, save_kwargs, verbose, param_fn,
+                      overrides):
         runs: list[MeasurementRun] = []
         n = len(self.measurements)
         overrides.pop("verbose", None)  # child stdout can't interleave cleanly
         if verbose:
             print(f"Running {n} measurement(s) on {workers} worker(s)...")
         with ProcessPoolExecutor(max_workers=workers) as pool:
+            # Resolve param_fn in the parent so only plain dicts cross to workers.
             futures = [pool.submit(run_measurement, m, save_root=save_root,
                                    save_kwargs=save_kwargs, keep_result=False,
-                                   **overrides)
+                                   **_merge_overrides(m, param_fn, overrides))
                        for m in self.measurements]
             for done, fut in enumerate(as_completed(futures), 1):
                 run = fut.result()
@@ -579,7 +639,11 @@ class BeamtimeIndex:
 
 def index_beamtime(directory: str, *, skip_echem: bool = True,
                    skip_aux: bool = True, recursive: bool = False) -> BeamtimeIndex:
-    """Index a beamtime directory into runnable :class:`Measurement` groups.
+    """Index a sample directory into runnable :class:`Measurement` groups.
+
+    The directory typically holds all measurements for a single compound
+    collected within a beamtime (the ``beamtime`` name is retained for backward
+    compatibility).
 
     Parameters
     ----------
@@ -726,20 +790,25 @@ def _group_xes(data: list[FileRecord], darks: list[FileRecord],
 
 def run_beamtimes(directories, *, save_root: str, max_workers: int | None = None,
                   index_kwargs: dict | None = None, verbose: bool = True,
-                  **overrides) -> dict[str, list[MeasurementRun]]:
-    """Index and run many beamtime directories, one output tree per beamtime.
+                  param_fn=None, **overrides) -> dict[str, list[MeasurementRun]]:
+    """Index and run many sample directories, one output tree per directory.
 
-    Thin composable driver over :func:`index_beamtime` + :meth:`BeamtimeIndex.run_all`
-    for automated re-processing of multiple past beamtimes. Each directory is
+    Each directory typically holds one compound's measurements collected within a
+    beamtime (the ``beamtime`` name is kept for backward compatibility). Thin
+    composable driver over :func:`index_beamtime` + :meth:`BeamtimeIndex.run_all`
+    for automated re-processing of many past directories. Each directory is
     indexed and run with its outputs written under
-    ``save_root/<directory_name>/analysis/`` (its own per-beamtime manifest
+    ``save_root/<directory_name>/analysis/`` (its own per-directory manifest
     included); a combined ``save_root/run_manifest.json`` is written across all
-    beamtimes.
+    directories.
 
-    Parameters mirror :meth:`BeamtimeIndex.run_all` (``max_workers``,
+    Parameters mirror :meth:`BeamtimeIndex.run_all` (``max_workers``, ``param_fn``,
     ``**overrides`` such as ``threshold``); ``index_kwargs`` is forwarded to
     :func:`index_beamtime` (e.g. ``{"skip_echem": False}``). ``save_root`` is
-    required. Returns ``{directory: [MeasurementRun, ...]}``.
+    required. Because ``param_fn`` receives each :class:`Measurement` (which
+    carries ``sample``, ``emission_line``, ``incident_energy``, ``kind``, and
+    ``label()``), one resolver can key off the sample to vary parameters per
+    measurement across every directory. Returns ``{directory: [MeasurementRun, ...]}``.
 
     This is deliberately just a loop over the public pieces -- for full control
     (or a SLURM job array with one directory per task) call ``index_beamtime`` +
@@ -754,7 +823,8 @@ def run_beamtimes(directories, *, save_root: str, max_workers: int | None = None
             print(f"=== beamtime: {name} ===")
         idx = index_beamtime(directory, **index_kwargs)
         runs = idx.run_all(save_root=os.path.join(save_root, name),
-                           max_workers=max_workers, verbose=verbose, **overrides)
+                           max_workers=max_workers, verbose=verbose,
+                           param_fn=param_fn, **overrides)
         all_runs[directory] = runs
         flat.extend(runs)
 
