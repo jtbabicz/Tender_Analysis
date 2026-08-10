@@ -788,6 +788,23 @@ def _group_xes(data: list[FileRecord], darks: list[FileRecord],
     return out
 
 
+def _beamtime_subdir(directory: str) -> str:
+    """Output subdirectory name for one input directory: ``<parent>_<name>``.
+
+    Prefixing with the parent folder disambiguates the common case where the same
+    compound is measured in more than one beamtime and stored in identically-named
+    directories (e.g. ``2025-06/CPMoTriCO3Dimer`` and ``2026-02/CPMoTriCO3Dimer``):
+    without the prefix both would write to the same output tree and silently
+    overwrite each other. Falls back to just ``<name>`` when there is no parent
+    component (a bare name or filesystem root).
+    """
+    norm = os.path.normpath(directory)
+    name = os.path.basename(norm)
+    parent = os.path.basename(os.path.dirname(norm))
+    stem = f"{parent}_{name}" if parent else name
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
+
+
 def run_beamtimes(directories, *, save_root: str, max_workers: int | None = None,
                   index_kwargs: dict | None = None, verbose: bool = True,
                   param_fn=None, **overrides) -> dict[str, list[MeasurementRun]]:
@@ -798,9 +815,13 @@ def run_beamtimes(directories, *, save_root: str, max_workers: int | None = None
     composable driver over :func:`index_beamtime` + :meth:`BeamtimeIndex.run_all`
     for automated re-processing of many past directories. Each directory is
     indexed and run with its outputs written under
-    ``save_root/<directory_name>/analysis/`` (its own per-directory manifest
-    included); a combined ``save_root/run_manifest.json`` is written across all
-    directories.
+    ``save_root/<parent>_<directory_name>/analysis/`` (its own per-directory
+    manifest included); a combined ``save_root/run_manifest.json`` is written
+    across all directories. The output name is prefixed with the parent folder so
+    the same compound measured in two beamtimes (identically-named directories,
+    e.g. ``2025-06/Sample`` and ``2026-02/Sample``) writes to distinct trees
+    instead of overwriting; if two inputs still resolve to the same output name a
+    :class:`ValueError` is raised rather than silently clobbering.
 
     Parameters mirror :meth:`BeamtimeIndex.run_all` (``max_workers``, ``param_fn``,
     ``**overrides`` such as ``threshold``); ``index_kwargs`` is forwarded to
@@ -817,8 +838,17 @@ def run_beamtimes(directories, *, save_root: str, max_workers: int | None = None
     index_kwargs = index_kwargs or {}
     all_runs: dict[str, list[MeasurementRun]] = {}
     flat: list[MeasurementRun] = []
+    seen: dict[str, str] = {}   # output subdir -> source directory (collision guard)
     for directory in directories:
-        name = os.path.basename(os.path.normpath(directory))
+        name = _beamtime_subdir(directory)
+        if name in seen and seen[name] != directory:
+            raise ValueError(
+                f"Output name {name!r} maps to two different input directories "
+                f"({seen[name]!r} and {directory!r}); their results would overwrite "
+                f"each other under {save_root!r}. Rename one input directory or run "
+                f"them with separate save_root values."
+            )
+        seen[name] = directory
         if verbose:
             print(f"=== beamtime: {name} ===")
         idx = index_beamtime(directory, **index_kwargs)
