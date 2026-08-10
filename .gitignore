@@ -6,6 +6,9 @@ data/elastic_H2OJet_MoL3val/
 # internal scratch / testing notebooks
 scratch_*.ipynb
 
+# HPC batch scripts (site-specific paths / conda env config)
+hpc/
+
 # python bytecode
 __pycache__/
 *.pyc
