@@ -1,15 +1,16 @@
 """Detector "banana"-shape (curvature) correction.
 
 Port of MATLAB ``sifAutoCorrelation.m``.  The emission line is not perfectly
-straight across the dispersive axis: its position along the 512 spatial rows
-drifts as a smooth (roughly quadratic) function of dispersive pixel.  We recover
-that drift by cross-correlation and shift each dispersive column back into
-alignment.
+straight on the detector: its position along the 2048-pixel dispersive axis
+drifts as a smooth (roughly quadratic) function of spatial row.  We recover
+that drift by cross-correlation and shift each spatial row back into
+alignment along the dispersive axis.
 
-Everything here works in the package's ``(height=512, width=2048)`` convention
-(see :mod:`onepot.sif_io`), which is exactly MATLAB's ``sig`` *after* its
-leading ``sig'`` transpose -- so the algorithm maps across directly without the
-MATLAB double-transpose bookkeeping.
+The package's ``(height=512, width=2048)`` frames (see :mod:`onepot.sif_io`)
+have the same orientation as the image MATLAB's ``sifread`` returns, i.e.
+MATLAB's ``sig`` *before* its leading ``sig'`` transpose.  :meth:`fit` and
+:meth:`apply` therefore transpose to ``(dispersive, spatial)`` like MATLAB
+does, and :meth:`apply` transposes the result back.
 """
 
 from __future__ import annotations
@@ -48,12 +49,12 @@ class CurvatureCorrection:
     Parameters
     ----------
     t:
-        Polynomial coefficients (highest degree first) of offset-vs-dispersive
-        pixel.  If ``None`` (default) they are fitted from the image passed to
+        Polynomial coefficients (highest degree first) of dispersive offset vs
+        spatial row.  If ``None`` (default) they are fitted from the image passed to
         :meth:`fit`.  The sentinel ``t=1`` (matching MATLAB) makes the transform
         an identity pass-through.
     n:
-        Dispersive binning factor.  ``None`` uses MATLAB's default
+        Spatial binning factor.  ``None`` uses MATLAB's default
         ``round(2**6 * min(shape) / 2048)``.
     """
 
@@ -72,8 +73,8 @@ class CurvatureCorrection:
         if self._identity or self.t is not None:
             return self
 
-        sig = np.asarray(image, dtype=float)  # (rows=512, dispersive=2048)
-        n_rows, n_disp = sig.shape
+        sig = np.asarray(image, dtype=float).T  # (dispersive=2048, spatial=512)
+        n_disp, n_spatial = sig.shape
 
         if self.n is None:
             n = int(round(2 ** 6 * min(sig.shape) / 2048))
@@ -82,9 +83,9 @@ class CurvatureCorrection:
         n = max(1, n)
         smooth_n = n
 
-        nbins = n_disp // n
-        # Per-bin spatial profiles (over the 512 rows), baseline-subtracted.
-        odp = np.zeros((n_rows, nbins))
+        nbins = n_spatial // n
+        # Per-bin dispersive profiles (over the 2048 pixels), baseline-subtracted.
+        odp = np.zeros((n_disp, nbins))
         for i in range(nbins):
             chunk = sig[:, i * n:(i + 1) * n].sum(axis=1)
             chunk = _matlab_smooth(chunk, smooth_n)
@@ -93,7 +94,7 @@ class CurvatureCorrection:
         sum_odp = odp.sum(axis=1)
 
         # Cross-correlate each bin's profile against the summed reference.
-        odp2 = np.zeros((2 * n_rows - 1, nbins))
+        odp2 = np.zeros((2 * n_disp - 1, nbins))
         locs = []
         for i in range(nbins):
             xc = correlate(sum_odp, odp[:, i], mode="full")
@@ -127,7 +128,7 @@ class CurvatureCorrection:
         """Return ``(corrected, X)`` for ``image``.
 
         ``corrected`` is the straightened image (same shape); ``X`` maps each
-        output pixel back to its original row index (0 where shifted in from
+        output pixel back to its original column index (0 where shifted in from
         outside the frame).
         """
         sig = np.asarray(image, dtype=float)
@@ -141,23 +142,25 @@ class CurvatureCorrection:
         if self.t is None:
             raise RuntimeError("CurvatureCorrection.apply called before fit()")
 
+        sig = sig.T  # (dispersive=2048, spatial=512), as in MATLAB
+        n_disp, n_spatial = sig.shape
         corrected = np.zeros_like(sig)
         X = np.zeros_like(sig)
-        rows = np.arange(1, n_rows + 1)  # 1-based row labels, as in MATLAB
+        cols = np.arange(1, n_disp + 1)  # 1-based column labels, as in MATLAB
 
-        for j in range(n_disp):
-            offset = int(round(np.polyval(self.t, j + 1)))  # +1: 1-based column
+        for j in range(n_spatial):
+            offset = int(round(np.polyval(self.t, j + 1)))  # +1: 1-based row
             if offset > 0:
-                corrected[:n_rows - offset, j] = sig[offset:, j]
-                X[:n_rows - offset, j] = rows[offset:]
+                corrected[:n_disp - offset, j] = sig[offset:, j]
+                X[:n_disp - offset, j] = cols[offset:]
             elif offset < 0:
-                corrected[-offset:, j] = sig[:n_rows + offset, j]
-                X[-offset:, j] = rows[:n_rows + offset]
+                corrected[-offset:, j] = sig[:n_disp + offset, j]
+                X[-offset:, j] = cols[:n_disp + offset]
             else:
                 corrected[:, j] = sig[:, j]
-                X[:, j] = rows
+                X[:, j] = cols
 
-        return corrected, X
+        return corrected.T, X.T
 
     def fit_apply(self, image: np.ndarray):
         """Convenience: :meth:`fit` then :meth:`apply` on the same image."""
