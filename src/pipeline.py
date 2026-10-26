@@ -120,6 +120,17 @@ class OnePot:
     verbose:
         Print progress: a header (files/frames/background) and a per-file line
         during extraction (default ``False``).
+    curvature:
+        Optional pre-fit :class:`CurvatureCorrection` to apply instead of
+        fitting one from this call's own (possibly small) frame subset. Fitting
+        is unstable on short subsets -- e.g. a 20-frame block of a scan gives a
+        visibly different fit than the full scan -- so when comparing many
+        subsets of the same dataset (radiation-damage block diagnostics, say),
+        fit once on a larger/independent sample and pass the *same* correction
+        to every subset for a fair comparison. Use ``CurvatureCorrection(t=1)``
+        to apply no correction at all (e.g. when only relative, uncalibrated
+        comparisons are needed). ``None`` (default) preserves existing
+        behavior: fit internally on every call, honoring ``evolution``.
     """
 
     def __init__(
@@ -134,6 +145,7 @@ class OnePot:
         scan_nbrs=None,
         histograms: bool = False,
         verbose: bool = False,
+        curvature: CurvatureCorrection | None = None,
     ):
         self.files = files
         self.thresholds = Thresholds.from_input(threshold)
@@ -145,6 +157,7 @@ class OnePot:
         self.scan_nbrs = scan_nbrs
         self.histograms = histograms
         self.verbose = verbose
+        self.curvature_input = curvature
 
         self._paths: list[str] | None = None
         self._sif: list[SifFile] | None = None
@@ -208,7 +221,15 @@ class OnePot:
                   f"frame(s)...")
         th = self.thresholds
 
-        if self.evolution:
+        if self.curvature_input is not None:
+            # Caller supplied a fixed correction: skip fitting entirely (both
+            # the evolution pre-pass and the final re-fit below), so every
+            # call sharing this correction is directly comparable.
+            result = self.analyze(bcg, [th.low, th.xray, th.hi],
+                                   curvature=self.curvature_input,
+                                   histograms=self.histograms)
+            t = self.curvature_input.t
+        elif self.evolution:
             # Pass 1: cutoff-only threshold, estimate curvature from the sum.
             first = self.analyze(bcg, [th.bcg_cutoff])
             _, t = self.correct(_sum_planes(first.signal))
@@ -246,7 +267,16 @@ class OnePot:
             "background": self._bcg_description(),
             "bcg_adjust": self.bcg_adjust,
             "evolution": self.evolution,
+            "curvature": self._curvature_description(),
         }
+
+    def _curvature_description(self) -> str:
+        if self.curvature_input is None:
+            return "fit per-call" + (" (evolution)" if self.evolution else "")
+        if self.curvature_input.t is not None and np.isscalar(self.curvature_input.t) \
+                and self.curvature_input.t == 1:
+            return "none (identity)"
+        return f"fixed, supplied t={self.curvature_input.t}"
 
     def _bcg_description(self) -> str:
         if self.bcg_input is None:
